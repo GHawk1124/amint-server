@@ -1,0 +1,6 @@
+uploads/
+__pycache__/
+*.db
+*.pdf
+*.txt
+.env
