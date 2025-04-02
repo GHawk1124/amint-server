@@ -22,6 +22,10 @@ from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
+
+ENV = os.getenv("APP_ENV", "development")
+IS_PRODUCTION = ENV == "production"
+
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 if not MISTRAL_API_KEY:
     raise ValueError("MISTRAL_API_KEY environment variable not set")
@@ -29,10 +33,21 @@ if not MISTRAL_API_KEY:
 # Initialize the FastAPI app
 app = FastAPI(title="AMINT API", description="API for the AMINT Temporal Hopfield Network")
 
+# Production allowed origins
+PRODUCTION_ORIGINS = [
+    "https://ghawk1124.github.io",
+    "https://www.ghawk1124.github.io"
+]
+
 # Configure CORS for frontend access
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:1420", "http://127.0.0.1:1420", "http://localhost:5173", "http://127.0.0.1:5173"],  # In production, restrict to your frontend URL
+    allow_origins=PRODUCTION_ORIGINS if IS_PRODUCTION else [
+        "http://localhost:1420", 
+        "http://127.0.0.1:1420", 
+        "http://localhost:5173", 
+        "http://127.0.0.1:5173"
+    ],  # In production, restrict to your frontend URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -117,28 +132,29 @@ async def login(user_data: UserLogin):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Login failed: {str(e)}")
 
-# New simple development login endpoint
-@app.post("/auth/dev-login")
-async def dev_login():
-    """Development-only endpoint for quick login without OAuth"""
-    try:
-        # Create a fixed development user for testing
-        dev_user = {
-            "id": "dev_user_123",
-            "email": "dev@example.com",
-            "name": "Dev User",
-            "picture": "https://via.placeholder.com/150",
-            "access_token": "dev_token"
-        }
-        
-        user_id = db_manager.create_user(dev_user)
-        
-        # Create initial empty network if user is new
-        network = get_user_network(user_id)
-        
-        return {"user_id": user_id, "email": dev_user["email"], "name": dev_user["name"]}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Development login failed: {str(e)}")
+if not IS_PRODUCTION:
+    # New simple development login endpoint
+    @app.post("/auth/dev-login")
+    async def dev_login():
+        """Development-only endpoint for quick login without OAuth"""
+        try:
+            # Create a fixed development user for testing
+            dev_user = {
+                "id": "dev_user_123",
+                "email": "dev@example.com",
+                "name": "Dev User",
+                "picture": "https://via.placeholder.com/150",
+                "access_token": "dev_token"
+            }
+            
+            user_id = db_manager.create_user(dev_user)
+            
+            # Create initial empty network if user is new
+            network = get_user_network(user_id)
+            
+            return {"user_id": user_id, "email": dev_user["email"], "name": dev_user["name"]}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Development login failed: {str(e)}")
 
 @app.get("/users/{user_id}")
 async def get_user(user_id: str):
@@ -195,6 +211,11 @@ async def upload_document(
 ):
     """Upload a document file, process it with OCR if needed, and add to the Hopfield network"""
     try:
+        # First, verify the user exists
+        user = db_manager.get_user(user_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+            
         # Create a unique filename
         file_extension = os.path.splitext(file.filename)[1] if file.filename else ""
         unique_filename = f"{uuid.uuid4()}{file_extension}"
@@ -220,8 +241,28 @@ async def upload_document(
                 source_type="uploaded_file",
                 metadata={"original_filename": file.filename}
             )
-            db_manager.add_document_container(container, user_id)
-            document_id = container.document_id
+            
+            # Create a properly structured dictionary
+            container_data = {
+                'document_id': container.document_id,
+                'title': container.title,
+                'timestamp': container.timestamp,
+                'source_type': container.source_type,
+                'metadata': container.metadata
+            }
+            
+            # Explicitly create document container and get the ID
+            document_id = db_manager.create_document_container(container_data, user_id)
+            print(f"Created document container with ID: {document_id}")
+        else:
+            # Verify document container exists if ID was provided
+            existing_container = db_manager.get_document_container(document_id)
+            if not existing_container:
+                raise HTTPException(status_code=404, detail="Document container not found")
+            container = DocumentContainer(
+                document_id=document_id,
+                title=title
+            )
             
         # Process the text and create memories
         container, memories = text_processor.process_document(
@@ -232,6 +273,15 @@ async def upload_document(
             use_section_detection=True
         )
         
+        # Make sure document_id is consistent
+        if container.document_id != document_id:
+            print(f"Warning: Document ID mismatch - updating from {container.document_id} to {document_id}")
+            container.document_id = document_id
+            
+        # Update parent_id for all memories
+        for memory in memories:
+            memory.parent_id = document_id
+            
         # Get user's network
         network = get_user_network(user_id, document_id)
         
@@ -239,7 +289,8 @@ async def upload_document(
         network.batch_store(memories)
         
         # Save network to database
-        save_network_to_db(network, db_manager, user_id)
+        save_stats = save_network_to_db(network, db_manager, user_id)
+        print(f"Network save stats: {save_stats}")
         
         return {
             "status": "success",
@@ -247,8 +298,9 @@ async def upload_document(
             "title": title,
             "memories_added": len(memories)
         }
-        
     except Exception as e:
+        print(f"Error processing document: {str(e)}")
+        print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Failed to process document: {str(e)}")
     finally:
         # Clean up uploaded file
@@ -353,179 +405,180 @@ async def get_network_stats(user_id: str, document_id: Optional[str] = None):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get network stats: {str(e)}")
 
-@app.post("/dev/add-dummy-files")
-async def add_dummy_files(data: DummyFileData):
-    """Development endpoint to add dummy file data to a user's network for testing"""
-    print(f"[DEBUG] add_dummy_files called with user_id: {data.user_id}, file_count: {data.file_count}")
-    try:
-        # Get the user's network
-        network = get_user_network(data.user_id)
-        print(f"[DEBUG] User network retrieved successfully: {len(network.memories)} existing memories")
-        
-        # Create a document container
-        document_container = DocumentContainer(
-            title="Dummy Files Collection",
-            source_type="code",
-            metadata={"type": "test_data", "generated_at": datetime.now().isoformat()}
-        )
-
-        # Add the document container to the network
-        print("[DEBUG] Adding document container to network...")
-        network.add_document_container(document_container)
-        
-        # Sample code snippets with different file types
-        file_samples = [
-            {
-                "name": "app.py",
-                "content": """
-def main():
-    print("Hello, world!")
-    # Process items in a loop
-    for i in range(10):
-        print(f"Processing item {i}")
-    return 0
-    
-if __name__ == "__main__":
-    main()
-                """,
-                "type": "python"
-            },
-            {
-                "name": "utils.js",
-                "content": """
-function formatDate(date) {
-  const day = date.getDate();
-  const month = date.getMonth() + 1;
-  const year = date.getFullYear();
-  return `${day}/${month}/${year}`;
-}
-
-export const sum = (a, b) => a + b;
-                """,
-                "type": "javascript"
-            },
-            {
-                "name": "styles.css",
-                "content": """
-.container {
-  display: flex;
-  flex-direction: column;
-  max-width: 1200px;
-  margin: 0 auto;
-}
-
-.header {
-  background-color: #f8f9fa;
-  padding: 20px;
-  border-bottom: 1px solid #e9ecef;
-}
-                """,
-                "type": "css"
-            },
-            {
-                "name": "README.md",
-                "content": """
-# Project Documentation
-
-This is a sample project that demonstrates how to use the AMINT API.
-
-## Getting Started
-
-1. Clone the repository
-2. Install dependencies with `npm install`
-3. Run the development server with `npm run dev`
-                """,
-                "type": "markdown"
-            },
-            {
-                "name": "index.html",
-                "content": """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Sample Page</title>
-  <link rel="stylesheet" href="styles.css">
-</head>
-<body>
-  <div class="container">
-    <header class="header">
-      <h1>Welcome to the Demo</h1>
-    </header>
-    <main>
-      <p>This is a demonstration of HTML content.</p>
-    </main>
-  </div>
-  <script src="utils.js"></script>
-</body>
-</html>
-                """,
-                "type": "html"
-            }
-        ]
-        print(f"[DEBUG] Loaded {len(file_samples)} file samples")
-        
-        # Generate memories for each file
-        memories = []
-        print(f"[DEBUG] Starting to process {data.file_count} files...")
-        
-        # Use only the number of files requested (with cycling if necessary)
-        for i in range(data.file_count):
-            file_sample = file_samples[i % len(file_samples)]
-            print(f"[DEBUG] Processing file {i+1}/{data.file_count}: {file_sample['name']}")
-            
-            try:
-                # Create memory for the file
-                # Embed the content using the text processor
-                print(f"[DEBUG] Embedding content for {file_sample['name']}...")
-                embedding = text_processor.embed_text(file_sample["content"])
-                print(f"[DEBUG] Embedding created successfully, shape: {embedding.shape}")
-                
-                memory = Memory(
-                    name=file_sample["name"],
-                    original_text=file_sample["content"],
-                    embeddings=embedding,
-                    parent_id=document_container.document_id,
-                    metadata={
-                        "file_type": file_sample["type"],
-                        "line_count": len(file_sample["content"].split("\n")),
-                        "size_bytes": len(file_sample["content"]),
-                        "is_dummy": True
-                    }
-                )
-                memories.append(memory)
-                print(f"[DEBUG] Memory object created for {file_sample['name']}")
-            except Exception as file_error:
-                print(f"[DEBUG] Error processing file {file_sample['name']}: {str(file_error)}")
-                print(f"[DEBUG] Error traceback: {traceback.format_exc()}")
-                raise  # Re-raise to be caught by the outer try-except
-                
-        # Add memories to the network
-        print(f"[DEBUG] Adding {len(memories)} memories to network...")
-        network.batch_store(memories)
-        
-        # Save to database with statistics
-        print("[DEBUG] Saving network to database...")
+if not IS_PRODUCTION:
+    @app.post("/dev/add-dummy-files")
+    async def add_dummy_files(data: DummyFileData):
+        """Development endpoint to add dummy file data to a user's network for testing"""
+        print(f"[DEBUG] add_dummy_files called with user_id: {data.user_id}, file_count: {data.file_count}")
         try:
-            stats = save_network_to_db(network, db_manager, data.user_id)
-            print(f"[DEBUG] Network saved successfully. Stats: {stats}")
-        except Exception as db_error:
-            print(f"[DEBUG] Database error: {str(db_error)}")
-            print(f"[DEBUG] Database error traceback: {traceback.format_exc()}")
-            stats = {"error": str(db_error)}
+            # Get the user's network
+            network = get_user_network(data.user_id)
+            print(f"[DEBUG] User network retrieved successfully: {len(network.memories)} existing memories")
+            
+            # Create a document container
+            document_container = DocumentContainer(
+                title="Dummy Files Collection",
+                source_type="code",
+                metadata={"type": "test_data", "generated_at": datetime.now().isoformat()}
+            )
+
+            # Add the document container to the network
+            print("[DEBUG] Adding document container to network...")
+            network.add_document_container(document_container)
+            
+            # Sample code snippets with different file types
+            file_samples = [
+                {
+                    "name": "app.py",
+                    "content": """
+    def main():
+        print("Hello, world!")
+        # Process items in a loop
+        for i in range(10):
+            print(f"Processing item {i}")
+        return 0
         
-        return {
-            "status": "success",
-            "message": f"Processed {len(memories)} files",
-            "document_id": document_container.document_id,
-            "file_names": [m.name for m in memories],
-            "stats": stats
-        }
-    except Exception as e:
-        print(f"[DEBUG] Error in add_dummy_files: {str(e)}")
-        print(f"[DEBUG] Error traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Adding dummy files failed: {str(e)}")
+    if __name__ == "__main__":
+        main()
+                    """,
+                    "type": "python"
+                },
+                {
+                    "name": "utils.js",
+                    "content": """
+    function formatDate(date) {
+    const day = date.getDate();
+    const month = date.getMonth() + 1;
+    const year = date.getFullYear();
+    return `${day}/${month}/${year}`;
+    }
+
+    export const sum = (a, b) => a + b;
+                    """,
+                    "type": "javascript"
+                },
+                {
+                    "name": "styles.css",
+                    "content": """
+    .container {
+    display: flex;
+    flex-direction: column;
+    max-width: 1200px;
+    margin: 0 auto;
+    }
+
+    .header {
+    background-color: #f8f9fa;
+    padding: 20px;
+    border-bottom: 1px solid #e9ecef;
+    }
+                    """,
+                    "type": "css"
+                },
+                {
+                    "name": "README.md",
+                    "content": """
+    # Project Documentation
+
+    This is a sample project that demonstrates how to use the AMINT API.
+
+    ## Getting Started
+
+    1. Clone the repository
+    2. Install dependencies with `npm install`
+    3. Run the development server with `npm run dev`
+                    """,
+                    "type": "markdown"
+                },
+                {
+                    "name": "index.html",
+                    "content": """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sample Page</title>
+    <link rel="stylesheet" href="styles.css">
+    </head>
+    <body>
+    <div class="container">
+        <header class="header">
+        <h1>Welcome to the Demo</h1>
+        </header>
+        <main>
+        <p>This is a demonstration of HTML content.</p>
+        </main>
+    </div>
+    <script src="utils.js"></script>
+    </body>
+    </html>
+                    """,
+                    "type": "html"
+                }
+            ]
+            print(f"[DEBUG] Loaded {len(file_samples)} file samples")
+            
+            # Generate memories for each file
+            memories = []
+            print(f"[DEBUG] Starting to process {data.file_count} files...")
+            
+            # Use only the number of files requested (with cycling if necessary)
+            for i in range(data.file_count):
+                file_sample = file_samples[i % len(file_samples)]
+                print(f"[DEBUG] Processing file {i+1}/{data.file_count}: {file_sample['name']}")
+                
+                try:
+                    # Create memory for the file
+                    # Embed the content using the text processor
+                    print(f"[DEBUG] Embedding content for {file_sample['name']}...")
+                    embedding = text_processor.embed_text(file_sample["content"])
+                    print(f"[DEBUG] Embedding created successfully, shape: {embedding.shape}")
+                    
+                    memory = Memory(
+                        name=file_sample["name"],
+                        original_text=file_sample["content"],
+                        embeddings=embedding,
+                        parent_id=document_container.document_id,
+                        metadata={
+                            "file_type": file_sample["type"],
+                            "line_count": len(file_sample["content"].split("\n")),
+                            "size_bytes": len(file_sample["content"]),
+                            "is_dummy": True
+                        }
+                    )
+                    memories.append(memory)
+                    print(f"[DEBUG] Memory object created for {file_sample['name']}")
+                except Exception as file_error:
+                    print(f"[DEBUG] Error processing file {file_sample['name']}: {str(file_error)}")
+                    print(f"[DEBUG] Error traceback: {traceback.format_exc()}")
+                    raise  # Re-raise to be caught by the outer try-except
+                    
+            # Add memories to the network
+            print(f"[DEBUG] Adding {len(memories)} memories to network...")
+            network.batch_store(memories)
+            
+            # Save to database with statistics
+            print("[DEBUG] Saving network to database...")
+            try:
+                stats = save_network_to_db(network, db_manager, data.user_id)
+                print(f"[DEBUG] Network saved successfully. Stats: {stats}")
+            except Exception as db_error:
+                print(f"[DEBUG] Database error: {str(db_error)}")
+                print(f"[DEBUG] Database error traceback: {traceback.format_exc()}")
+                stats = {"error": str(db_error)}
+            
+            return {
+                "status": "success",
+                "message": f"Processed {len(memories)} files",
+                "document_id": document_container.document_id,
+                "file_names": [m.name for m in memories],
+                "stats": stats
+            }
+        except Exception as e:
+            print(f"[DEBUG] Error in add_dummy_files: {str(e)}")
+            print(f"[DEBUG] Error traceback: {traceback.format_exc()}")
+            raise HTTPException(status_code=500, detail=f"Adding dummy files failed: {str(e)}")
 
 @app.post("/files/query")
 async def query_files(query: FileQuery, user_id: str):
