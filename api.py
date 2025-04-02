@@ -36,7 +36,8 @@ app = FastAPI(title="AMINT API", description="API for the AMINT Temporal Hopfiel
 # Production allowed origins
 PRODUCTION_ORIGINS = [
     "https://ghawk1124.github.io",
-    "https://www.ghawk1124.github.io"
+    "https://www.ghawk1124.github.io",
+    "https://amint-server.onrender.com"
 ]
 
 # Configure CORS for frontend access
