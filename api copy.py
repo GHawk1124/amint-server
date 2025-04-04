@@ -1,12 +1,11 @@
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request, Response
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Dict, List, Optional, Any
 import os
 import json
 import uuid
-import httpx
 from datetime import datetime, timedelta
 import shutil
 import asyncio
@@ -17,44 +16,31 @@ import traceback
 from google.generativeai import GenerativeModel
 import google.generativeai as genai
 from gemini import format_context_from_memories, query_gemini
+
 # Import our modules
 from temporal_hopfield_network import ModernHopfieldNetwork, Memory, DocumentContainer, TextProcessor
 from sqlite import SQLiteManager, create_hopfield_network_from_db, save_network_to_db
 from mistral import get_ocr_result
 from dotenv import load_dotenv
-import jwt
-from fastapi.security import OAuth2PasswordBearer
-from starlette.middleware.sessions import SessionMiddleware
 
 # Load environment variables
 load_dotenv()
+
 ENV = os.getenv("APP_ENV", "development")
 print(ENV)
 IS_PRODUCTION = ENV == "production"
+
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 if not MISTRAL_API_KEY:
     raise ValueError("MISTRAL_API_KEY environment variable not set")
+
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY environment variable not set")
-
-# Google OAuth Configuration
-GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
-GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
-GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/google/callback")
-if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
-    raise ValueError("Google OAuth environment variables not set")
-
-# Session secret key
-SECRET_KEY = os.getenv("SECRET_KEY", str(uuid.uuid4()))
-
 genai.configure(api_key=GEMINI_API_KEY)
 
 # Initialize the FastAPI app
 app = FastAPI(title="AMINT API", description="API for the AMINT Temporal Hopfield Network")
-
-# Add session middleware
-app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY)
 
 # Production allowed origins
 PRODUCTION_ORIGINS = [
@@ -69,11 +55,11 @@ PRODUCTION_ORIGINS = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=PRODUCTION_ORIGINS if IS_PRODUCTION else [
-        "http://localhost:1420",
-        "http://127.0.0.1:1420",
-        "http://localhost:5173",
+        "http://localhost:1420", 
+        "http://127.0.0.1:1420", 
+        "http://localhost:5173", 
         "http://127.0.0.1:5173"
-    ],
+    ],  # In production, restrict to your frontend URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -135,17 +121,6 @@ class MemoryQueryResponse(BaseModel):
     gemini_response: Optional[str] = None
     use_gemini: bool = False
 
-# OAuth2 password bearer for token validation
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token", auto_error=False)
-
-# Helper function to get user from session
-async def get_current_user(request: Request):
-    """Get the current user from session"""
-    user_id = request.session.get("user_id")
-    if not user_id:
-        return None
-    return db_manager.get_user(user_id)
-
 # Helper function to get a network for a user
 def get_user_network(user_id: str, document_id: Optional[str] = None) -> ModernHopfieldNetwork:
     """Get or create a Hopfield network for a user"""
@@ -164,114 +139,23 @@ def get_user_network(user_id: str, document_id: Optional[str] = None) -> ModernH
 async def root():
     return {"message": "Welcome to AMINT API"}
 
-# Google OAuth routes
-@app.get("/auth/google/login")
-async def google_login():
-    """Start the Google OAuth flow"""
-    google_auth_url = "https://accounts.google.com/o/oauth2/v2/auth"
-    params = {
-        "client_id": GOOGLE_CLIENT_ID,
-        "redirect_uri": GOOGLE_REDIRECT_URI,
-        "response_type": "code",
-        "scope": "openid email profile",
-        "access_type": "offline",
-        "prompt": "consent",  # Force refresh token
-    }
-    url = f"{google_auth_url}?{'&'.join([f'{k}={v}' for k, v in params.items()])}"
-    return RedirectResponse(url)
-
-@app.get("/auth/google/callback")
-async def google_callback(request: Request, code: str):
-    """Handle the Google OAuth callback"""
+@app.post("/auth/login")
+async def login(user_data: UserLogin):
+    """Log in or register a user with Google OAuth data"""
     try:
-        # Exchange authorization code for tokens
-        token_url = "https://oauth2.googleapis.com/token"
-        token_data = {
-            "client_id": GOOGLE_CLIENT_ID,
-            "client_secret": GOOGLE_CLIENT_SECRET,
-            "code": code,
-            "grant_type": "authorization_code",
-            "redirect_uri": GOOGLE_REDIRECT_URI,
-        }
-        
-        async with httpx.AsyncClient() as client:
-            token_response = await client.post(token_url, data=token_data)
-            
-        if not token_response.status_code == 200:
-            raise HTTPException(status_code=400, detail="Failed to get token from Google")
-            
-        token_info = token_response.json()
-        access_token = token_info.get("access_token")
-        refresh_token = token_info.get("refresh_token")
-        id_token = token_info.get("id_token")
-        
-        # Decode the id_token to get user info (without verification for simplicity)
-        # In production, you should verify the token's signature
-        user_info = jwt.decode(id_token, options={"verify_signature": False})
-        
-        # Create a unique ID for this Google user
-        google_user_id = f"google_{user_info.get('sub')}"
-        
-        # Create/update user in database
-        user_data = {
-            "id": google_user_id,
-            "email": user_info.get("email"),
-            "name": user_info.get("name"),
-            "picture": user_info.get("picture"),
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-            "token_expiry": (datetime.now() + timedelta(seconds=token_info.get("expires_in", 3600))).isoformat()
-        }
-        
-        user_id = db_manager.create_user(user_data)
-        
-        # Save user ID in session
-        request.session["user_id"] = user_id
+        user_id = db_manager.create_user(user_data.dict())
         
         # Create initial empty network if user is new
         network = get_user_network(user_id)
         
-        # Redirect to the frontend with success
-        frontend_url = "http://localhost:1420" if not IS_PRODUCTION else "https://ghawk1124.github.io/amint"
-        return RedirectResponse(f"{frontend_url}?auth=success")
-    
+        return {"user_id": user_id, "status": "success"}
     except Exception as e:
-        print(f"Google OAuth error: {str(e)}")
-        print(traceback.format_exc())
-        # Redirect to the frontend with error
-        frontend_url = "http://localhost:1420" if not IS_PRODUCTION else "https://ghawk1124.github.io/amint"
-        return RedirectResponse(f"{frontend_url}?auth=error&message={str(e)}")
-
-@app.get("/auth/session")
-async def get_session(request: Request):
-    """Get the current user session"""
-    user = await get_current_user(request)
-    if not user:
-        return {"authenticated": False}
-    
-    # Remove sensitive information
-    if "access_token" in user:
-        del user["access_token"]
-    if "refresh_token" in user:
-        del user["refresh_token"]
-    if "token_expiry" in user:
-        del user["token_expiry"]
-        
-    return {
-        "authenticated": True,
-        "user": user
-    }
-
-@app.post("/auth/logout")
-async def logout(request: Request):
-    """Log out the current user"""
-    request.session.clear()
-    return {"status": "success"}
+        raise HTTPException(status_code=500, detail=f"Login failed: {str(e)}")
 
 if not IS_PRODUCTION:
     # New simple development login endpoint
     @app.post("/auth/dev-login")
-    async def dev_login(request: Request):
+    async def dev_login():
         """Development-only endpoint for quick login without OAuth"""
         try:
             # Create a fixed development user for testing
@@ -282,10 +166,8 @@ if not IS_PRODUCTION:
                 "picture": "https://via.placeholder.com/150",
                 "access_token": "dev_token"
             }
-            user_id = db_manager.create_user(dev_user)
             
-            # Save user ID in session
-            request.session["user_id"] = user_id
+            user_id = db_manager.create_user(dev_user)
             
             # Create initial empty network if user is new
             network = get_user_network(user_id)
@@ -294,32 +176,9 @@ if not IS_PRODUCTION:
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Development login failed: {str(e)}")
 
-@app.get("/users/me")
-async def get_current_user_info(request: Request):
-    """Get the current authenticated user's information"""
-    user = await get_current_user(request)
-    if not user:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-        
-    # Remove sensitive information
-    if "access_token" in user:
-        del user["access_token"]
-    if "refresh_token" in user:
-        del user["refresh_token"]
-    if "token_expiry" in user:
-        del user["token_expiry"]
-        
-    return user
-
 @app.get("/users/{user_id}")
-async def get_user(user_id: str, request: Request):
-    """Get user information (checking session authorization)"""
-    current_user = await get_current_user(request)
-    
-    # Basic authorization check - only allow getting your own user info or admin
-    if not current_user or (current_user.get("id") != user_id and not current_user.get("is_admin", False)):
-        raise HTTPException(status_code=403, detail="Not authorized to access this user information")
-    
+async def get_user(user_id: str):
+    """Get user information"""
     user = db_manager.get_user(user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -329,28 +188,23 @@ async def get_user(user_id: str, request: Request):
         del user["access_token"]
     if "refresh_token" in user:
         del user["refresh_token"]
-    if "token_expiry" in user:
-        del user["token_expiry"]
         
     return user
 
 @app.post("/documents/create")
-async def create_document(doc_request: DocumentRequest, request: Request):
+async def create_document(doc_request: DocumentRequest, user_id: str):
     """Create a new document container"""
-    user = await get_current_user(request)
-    if not user:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-        
     try:
-        user_id = user["id"]
         # Create document container
         container = DocumentContainer(
             title=doc_request.title,
             source_type=doc_request.source_type,
             metadata=doc_request.metadata
         )
+        
         # Store in database
         db_manager.add_document_container(container, user_id)
+        
         return {
             "document_id": container.document_id,
             "title": container.title,
@@ -360,14 +214,9 @@ async def create_document(doc_request: DocumentRequest, request: Request):
         raise HTTPException(status_code=500, detail=f"Failed to create document: {str(e)}")
 
 @app.get("/documents")
-async def list_documents(request: Request):
+async def list_documents(user_id: str):
     """List all documents for a user"""
-    user = await get_current_user(request)
-    if not user:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-        
     try:
-        user_id = user["id"]
         documents = db_manager.get_user_documents(user_id)
         return {"documents": documents}
     except Exception as e:
@@ -375,19 +224,18 @@ async def list_documents(request: Request):
 
 @app.post("/documents/upload")
 async def upload_document(
-    request: Request,
+    user_id: str = Form(...),
     document_id: Optional[str] = Form(None),
     title: str = Form(...),
     file: UploadFile = File(...)
 ):
     """Upload a document file, process it with OCR if needed, and add to the Hopfield network"""
-    user = await get_current_user(request)
-    if not user:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-        
     try:
-        user_id = user["id"]
-        
+        # First, verify the user exists
+        user = db_manager.get_user(user_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+            
         # Create a unique filename
         file_extension = os.path.splitext(file.filename)[1] if file.filename else ""
         unique_filename = f"{uuid.uuid4()}{file_extension}"
@@ -396,7 +244,7 @@ async def upload_document(
         # Save the uploaded file
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-        
+            
         # Process file based on type
         if file_extension.lower() in ['.pdf', '.jpg', '.jpeg', '.png']:
             # Use Mistral OCR
@@ -405,7 +253,7 @@ async def upload_document(
             # Assume it's a text file
             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                 extracted_text = f.read()
-        
+                
         # Create document container if not provided
         if not document_id:
             container = DocumentContainer(
@@ -413,6 +261,7 @@ async def upload_document(
                 source_type="uploaded_file",
                 metadata={"original_filename": file.filename}
             )
+            
             # Create a properly structured dictionary
             container_data = {
                 'document_id': container.document_id,
@@ -421,6 +270,7 @@ async def upload_document(
                 'source_type': container.source_type,
                 'metadata': container.metadata
             }
+            
             # Explicitly create document container and get the ID
             document_id = db_manager.create_document_container(container_data, user_id)
             print(f"Created document container with ID: {document_id}")
@@ -433,7 +283,7 @@ async def upload_document(
                 document_id=document_id,
                 title=title
             )
-        
+            
         # Process the text and create memories
         container, memories = text_processor.process_document(
             title=title,
@@ -447,11 +297,11 @@ async def upload_document(
         if container.document_id != document_id:
             print(f"Warning: Document ID mismatch - updating from {container.document_id} to {document_id}")
             container.document_id = document_id
-        
+            
         # Update parent_id for all memories
         for memory in memories:
             memory.parent_id = document_id
-        
+            
         # Get user's network
         network = get_user_network(user_id, document_id)
         
@@ -478,14 +328,9 @@ async def upload_document(
             os.remove(file_path)
 
 @app.post("/memories/query")
-async def query_memories(query: MemoryQuery, request: Request):
+async def query_memories(query: MemoryQuery, user_id: str):
     """Query the Hopfield network for memories matching the input text"""
-    user = await get_current_user(request)
-    if not user:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-        
     try:
-        user_id = user["id"]
         # Get user's network
         network = get_user_network(user_id, query.document_id)
         
@@ -506,15 +351,16 @@ async def query_memories(query: MemoryQuery, request: Request):
                 "timestamp": memory.timestamp.isoformat() if memory.timestamp else None,
                 "metadata": memory.metadata
             })
-        
+            
         # Get Gemini response if use_gemini flag is set
         gemini_response = None
         if getattr(query, 'use_gemini', False) and results:
             # Format context from top memories
             context = format_context_from_memories(results[:5])  # Use top 5 memories
+            
             # Query Gemini with user input and context
             gemini_response = query_gemini(query.query_text, context)
-        
+            
         return MemoryQueryResponse(
             results=results,
             gemini_response=gemini_response,
@@ -525,19 +371,14 @@ async def query_memories(query: MemoryQuery, request: Request):
 
 @app.get("/memories/query")
 async def query_memories_get(
-    request: Request,
+    user_id: str,
     query_text: str,
     document_id: Optional[str] = None,
     k: int = 5,
     use_gemini: bool = False
 ):
     """GET endpoint to query the Hopfield network for memories matching the input text"""
-    user = await get_current_user(request)
-    if not user:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-        
     try:
-        user_id = user["id"]
         # Get user's network
         network = get_user_network(user_id, document_id)
         
@@ -555,19 +396,20 @@ async def query_memories_get(
                 "text": memory.original_text,
                 "name": memory.name,
                 "section_title": memory.section_title,
-                "timestamp": memory.timestamp.isoformat() if memory.timestamp else None,
+                "timestamp": memory.timestamp.format() if memory.timestamp else None,
                 "metadata": memory.metadata
             })
-        
+            
         # Get Gemini response if use_gemini flag is set
         gemini_response = None
         if use_gemini and results:
             # Format context from top memories (limited to top 5)
             top_memories = results[:5]
             context = format_context_from_memories(top_memories)
+            
             # Query Gemini with user input and context
             gemini_response = query_gemini(query_text, context)
-        
+            
         return {
             "results": results,
             "gemini_response": gemini_response,
@@ -580,14 +422,9 @@ async def query_memories_get(
         raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
 
 @app.get("/network/stats")
-async def get_network_stats(request: Request, document_id: Optional[str] = None):
+async def get_network_stats(user_id: str, document_id: Optional[str] = None):
     """Get statistics about a user's network"""
-    user = await get_current_user(request)
-    if not user:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-        
     try:
-        user_id = user["id"]
         # Get user's network
         network = get_user_network(user_id, document_id)
         
@@ -612,23 +449,18 @@ async def get_network_stats(request: Request, document_id: Optional[str] = None)
             "document_count": document_count,
             "document_info": document_info
         }
+    
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get network stats: {str(e)}")
 
 if not IS_PRODUCTION:
     @app.post("/dev/add-dummy-files")
-    async def add_dummy_files(data: DummyFileData, request: Request):
+    async def add_dummy_files(data: DummyFileData):
         """Development endpoint to add dummy file data to a user's network for testing"""
-        user = await get_current_user(request)
-        if not user and data.user_id != "dev_user_123":  # Special case for dev user
-            raise HTTPException(status_code=401, detail="Not authenticated")
-            
-        user_id = user["id"] if user else data.user_id
-        print(f"[DEBUG] add_dummy_files called with user_id: {user_id}, file_count: {data.file_count}")
-        
+        print(f"[DEBUG] add_dummy_files called with user_id: {data.user_id}, file_count: {data.file_count}")
         try:
             # Get the user's network
-            network = get_user_network(user_id)
+            network = get_user_network(data.user_id)
             print(f"[DEBUG] User network retrieved successfully: {len(network.memories)} existing memories")
             
             # Create a document container
@@ -637,7 +469,7 @@ if not IS_PRODUCTION:
                 source_type="code",
                 metadata={"type": "test_data", "generated_at": datetime.now().isoformat()}
             )
-            
+
             # Add the document container to the network
             print("[DEBUG] Adding document container to network...")
             network.add_document_container(document_container)
@@ -653,14 +485,86 @@ if not IS_PRODUCTION:
         for i in range(10):
             print(f"Processing item {i}")
         return 0
+        
     if __name__ == "__main__":
         main()
                     """,
                     "type": "python"
                 },
-                # ... [rest of the file samples remain the same]
+                {
+                    "name": "utils.js",
+                    "content": """
+    function formatDate(date) {
+    const day = date.getDate();
+    const month = date.getMonth() + 1;
+    const year = date.getFullYear();
+    return `${day}/${month}/${year}`;
+    }
+
+    export const sum = (a, b) => a + b;
+                    """,
+                    "type": "javascript"
+                },
+                {
+                    "name": "styles.css",
+                    "content": """
+    .container {
+    display: flex;
+    flex-direction: column;
+    max-width: 1200px;
+    margin: 0 auto;
+    }
+
+    .header {
+    background-color: #f8f9fa;
+    padding: 20px;
+    border-bottom: 1px solid #e9ecef;
+    }
+                    """,
+                    "type": "css"
+                },
+                {
+                    "name": "README.md",
+                    "content": """
+    # Project Documentation
+
+    This is a sample project that demonstrates how to use the AMINT API.
+
+    ## Getting Started
+
+    1. Clone the repository
+    2. Install dependencies with `npm install`
+    3. Run the development server with `npm run dev`
+                    """,
+                    "type": "markdown"
+                },
+                {
+                    "name": "index.html",
+                    "content": """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sample Page</title>
+    <link rel="stylesheet" href="styles.css">
+    </head>
+    <body>
+    <div class="container">
+        <header class="header">
+        <h1>Welcome to the Demo</h1>
+        </header>
+        <main>
+        <p>This is a demonstration of HTML content.</p>
+        </main>
+    </div>
+    <script src="utils.js"></script>
+    </body>
+    </html>
+                    """,
+                    "type": "html"
+                }
             ]
-            
             print(f"[DEBUG] Loaded {len(file_samples)} file samples")
             
             # Generate memories for each file
@@ -697,7 +601,7 @@ if not IS_PRODUCTION:
                     print(f"[DEBUG] Error processing file {file_sample['name']}: {str(file_error)}")
                     print(f"[DEBUG] Error traceback: {traceback.format_exc()}")
                     raise  # Re-raise to be caught by the outer try-except
-            
+                    
             # Add memories to the network
             print(f"[DEBUG] Adding {len(memories)} memories to network...")
             network.batch_store(memories)
@@ -705,7 +609,7 @@ if not IS_PRODUCTION:
             # Save to database with statistics
             print("[DEBUG] Saving network to database...")
             try:
-                stats = save_network_to_db(network, db_manager, user_id)
+                stats = save_network_to_db(network, db_manager, data.user_id)
                 print(f"[DEBUG] Network saved successfully. Stats: {stats}")
             except Exception as db_error:
                 print(f"[DEBUG] Database error: {str(db_error)}")
@@ -725,14 +629,9 @@ if not IS_PRODUCTION:
             raise HTTPException(status_code=500, detail=f"Adding dummy files failed: {str(e)}")
 
 @app.post("/files/query")
-async def query_files(query: FileQuery, request: Request):
+async def query_files(query: FileQuery, user_id: str):
     """Query the Hopfield network for file content matching the input text"""
-    user = await get_current_user(request)
-    if not user:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-        
     try:
-        user_id = user["id"]
         # Get user's network
         network = get_user_network(user_id)
         
@@ -750,7 +649,7 @@ async def query_files(query: FileQuery, request: Request):
                 # If file_types filter is applied and this file type is not in the list, skip it
                 if query.file_types and memory.metadata['file_type'] not in query.file_types:
                     continue
-                
+                    
                 file_results.append({
                     "memory_id": memory.memory_id,
                     "file_name": memory.name,
@@ -763,12 +662,13 @@ async def query_files(query: FileQuery, request: Request):
                 })
         
         return {"results": file_results}
+    
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"File query failed: {str(e)}")
 
 @app.get("/files/query")
 async def query_files_get(
-    request: Request,
+    user_id: str,
     query_text: str,
     file_types: Optional[str] = None,  # Comma-separated file types
     k: int = 5
@@ -781,7 +681,7 @@ async def query_files_get(
     query = FileQuery(query_text=query_text, file_types=file_types_list, k=k)
     
     # Reuse the POST endpoint logic
-    return await query_files(query, request)
+    return await query_files(query, user_id)
 
 if __name__ == "__main__":
     import uvicorn
