@@ -7,6 +7,13 @@ import numpy as np
 import uuid
 from datetime import datetime
 from typing import List, Dict, Union, Optional, Tuple, Any, cast
+from temporal_hopfield_network import ModernHopfieldNetwork, Memory, DocumentContainer
+from khm_network import KernelizedHopfieldNetwork, FeatureMap
+
+DEFAULT_KHM_FEATURE_DIM = 384
+DEFAULT_KHM_HIDDEN_DIM = 512
+DEFAULT_KHM_NUM_HEADS = 4
+DEFAULT_EMBEDDING_DIM = 384
 
 # Database file path
 DB_PATH = 'amint.db'
@@ -123,6 +130,85 @@ class SQLiteManager:
             raise e
         finally:
             conn.close()
+
+    def update_document_container(self, document_id: str, data_to_update: Dict[str, Any]) -> bool:
+        """Update specific fields of a document container."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        fields = []
+        params = []
+        allowed_fields = ['title', 'source_type', 'metadata', 'timestamp'] # Fields allowed to be updated
+
+        for field in allowed_fields:
+            if field in data_to_update:
+                fields.append(f"{field} = ?")
+                value = data_to_update[field]
+                # Serialize metadata
+                if field == 'metadata':
+                    value = json.dumps(value or {})
+                params.append(value)
+
+        if not fields:
+            return False # Nothing to update
+
+        params.append(document_id) # For the WHERE clause
+
+        try:
+            query = f"UPDATE document_containers SET {', '.join(fields)} WHERE document_id = ?"
+            cursor.execute(query, tuple(params))
+            conn.commit()
+            return cursor.rowcount > 0
+        except Exception as e:
+            conn.rollback()
+            print(f"Error updating document container {document_id}: {e}")
+            raise e
+        finally:
+            conn.close()
+            
+    # Add count_user_document_containers
+    def count_user_document_containers(self, user_id: str) -> int:
+         """Count all document containers for a user."""
+         conn = self.get_connection()
+         cursor = conn.cursor()
+         cursor.execute('SELECT COUNT(*) FROM document_containers WHERE user_id = ?', (user_id,))
+         count = cursor.fetchone()[0]
+         conn.close()
+         return count
+
+    # --- MODIFIED: Add optional document_id parameter ---
+    def count_user_memories(self, user_id: str, document_id: Optional[str] = None) -> int:
+         """Count memories for a user, optionally filtered by document."""
+         conn = self.get_connection()
+         cursor = conn.cursor()
+         count = 0 # Initialize count
+         try:
+             if document_id:
+                 # Ensure the user owns the document before counting its memories
+                 # Check ownership first
+                 cursor.execute('SELECT user_id FROM document_containers WHERE document_id = ?', (document_id,))
+                 container_owner = cursor.fetchone()
+
+                 is_dev_null_access = user_id == "dev_user_123" and container_owner and container_owner['user_id'] is None
+
+                 if container_owner and (container_owner['user_id'] == user_id or is_dev_null_access):
+                      cursor.execute('SELECT COUNT(*) FROM memories WHERE parent_id = ?', (document_id,))
+                      count_result = cursor.fetchone()
+                      count = count_result[0] if count_result else 0
+                 else:
+                      # Document doesn't exist or user doesn't own it
+                      print(f"[Info] count_user_memories: Document {document_id} not found or not owned by user {user_id}.")
+                      count = 0
+             else:
+                 # Count all memories for the user
+                 cursor.execute('SELECT COUNT(*) FROM memories WHERE user_id = ?', (user_id,))
+                 count_result = cursor.fetchone()
+                 count = count_result[0] if count_result else 0
+         except Exception as e:
+              print(f"Error in count_user_memories: {e}")
+              count = 0 # Return 0 on error
+         finally:
+              conn.close()
+         return count
     
     def get_user(self, user_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -292,6 +378,16 @@ class SQLiteManager:
         
         return result
     
+    def get_user_documents(self, user_id: str) -> List[Dict[str, Any]]:
+        """
+        Alias for get_user_document_containers to maintain API compatibility
+        Args:
+            user_id: User ID
+        Returns:
+            List of document container data
+        """
+        return self.get_user_document_containers(user_id)
+    
     # ===== Memory Management =====
     
     def _blob_to_tensor(self, blob: bytes) -> torch.Tensor:
@@ -435,6 +531,39 @@ class SQLiteManager:
             result.append(memory_dict)
         
         return result
+    
+    def count_user_memories(self, user_id: str, document_id: Optional[str] = None) -> int:
+         """Count memories for a user, optionally filtered by document."""
+         conn = self.get_connection()
+         cursor = conn.cursor()
+         count = 0 # Initialize count
+         try:
+             if document_id:
+                 # Ensure the user owns the document before counting its memories
+                 # Check ownership first
+                 cursor.execute('SELECT user_id FROM document_containers WHERE document_id = ?', (document_id,))
+                 container_owner = cursor.fetchone()
+                 # Allow dev user access if container user_id is NULL
+                 is_dev_null_access = user_id == "dev_user_123" and container_owner and container_owner['user_id'] is None
+                 if container_owner and (container_owner['user_id'] == user_id or is_dev_null_access):
+                      cursor.execute('SELECT COUNT(*) FROM memories WHERE parent_id = ?', (document_id,))
+                      count_result = cursor.fetchone()
+                      count = count_result[0] if count_result else 0
+                 else:
+                      # Document doesn't exist or user doesn't own it
+                      print(f"[Info] count_user_memories: Document {document_id} not found or not owned by user {user_id}.")
+                      count = 0
+             else:
+                 # Count all memories for the user
+                 cursor.execute('SELECT COUNT(*) FROM memories WHERE user_id = ?', (user_id,))
+                 count_result = cursor.fetchone()
+                 count = count_result[0] if count_result else 0
+         except Exception as e:
+              print(f"Error in count_user_memories: {e}")
+              count = 0 # Return 0 on error
+         finally:
+              conn.close()
+         return count
     
     def update_memory(self, memory_id: str, new_data: Dict[str, Any]) -> bool:
         """
@@ -587,139 +716,246 @@ class SQLiteManager:
             'metadata': container_dict['metadata']
         }
 
-# Example for how to use this with ModernHopfieldNetwork from temporal_hopfield_network.py
-def create_hopfield_network_from_db(db_manager: SQLiteManager, document_id: str = None, user_id: str = None):
+def create_hopfield_network_from_db(
+    db_manager: SQLiteManager,
+    network_type: str, # <-- NEW: Specify which type to create
+    document_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    khm_config: Optional[Dict[str, Any]] = None # <-- NEW: KHM parameters
+) -> Union[ModernHopfieldNetwork, KernelizedHopfieldNetwork, Any]:
     """
-    Create a ModernHopfieldNetwork and load memories from the database
-    
+    Create a Hopfield Network (Modern or KHM) and load memories from the database.
     Args:
-        db_manager: SQLiteManager instance
-        document_id: Optional document ID to load memories from
-        user_id: Optional user ID to load memories from
-        
+        db_manager: SQLiteManager instance.
+        network_type: 'modern' or 'khm'.
+        document_id: Optional document ID to load memories from.
+        user_id: Optional user ID to load memories from.
+        khm_config: Optional dict with 'feature_dim', 'hidden_dim', 'num_heads' for KHM.
     Returns:
-        ModernHopfieldNetwork with loaded memories
+        Initialized Hopfield network with loaded memories.
     """
-    from temporal_hopfield_network import ModernHopfieldNetwork, Memory, DocumentContainer
-    
-    # Get embedding dimensions from first memory (assuming at least one exists)
+    if not user_id:
+         # If only document_id is provided, we need to find the user_id associated with it
+         if document_id:
+              container_data = db_manager.get_document_container(document_id)
+              if container_data and container_data.get('user_id'):
+                   user_id = container_data['user_id']
+              else:
+                   # Handle cases where document has no user or doesn't exist
+                   # If it's a shared/unowned document, maybe load without user context?
+                   # For now, raise error if user context is expected but not found
+                   raise ValueError(f"Cannot determine user_id for document_id {document_id}")
+         else:
+              raise ValueError("Either document_id or user_id must be provided")
+
+    print(f"Loading network data for user {user_id} (Doc: {document_id}, Type: {network_type.upper()})")
+
+    # Determine memories to load
     if document_id:
-        memories_data = db_manager.get_document_memories(document_id)
-    elif user_id:
-        memories_data = db_manager.get_user_memories(user_id)
-    else:
-        raise ValueError("Either document_id or user_id must be provided")
-    
-    if not memories_data:
-        # Default dimension if no memories exist
-        embedding_dim = 384  # Default for 'all-MiniLM-L6-v2' model
-    else:
-        embedding_dim = memories_data[0]['embeddings'].shape[0]
-    
-    # Create network
-    network = ModernHopfieldNetwork(embedding_dim=embedding_dim)
-    
-    # Load document containers if needed
-    if document_id:
+        # Important: Verify user owns this document before loading memories
         container_data = db_manager.get_document_container(document_id)
-        if container_data:
-            container = DocumentContainer(
-                title=container_data['title'],
-                document_id=container_data['document_id'],
-                timestamp=container_data['timestamp'],
-                source_type=container_data['source_type'],
-                metadata=container_data['metadata']
-            )
-            network.add_document_container(container)
-    
-    # Load memories
-    for memory_data in memories_data:
-        memory = Memory(
-            name=memory_data['name'],
-            original_text=memory_data['original_text'],
-            embeddings=memory_data['embeddings'],
-            memory_id=memory_data['memory_id'],
-            timestamp=memory_data['timestamp'],
-            parent_id=memory_data['parent_id'],
-            section_title=memory_data['section_title'],
-            metadata=memory_data['metadata']
+        if not container_data or container_data.get('user_id') != user_id:
+             # Allow dev user access to null user_id docs?
+             is_dev_accessing_null = user_id == "dev_user_123" and container_data and container_data.get('user_id') is None
+             if not is_dev_accessing_null:
+                  raise ValueError(f"User {user_id} not authorized for document {document_id}")
+        memories_data = db_manager.get_document_memories(document_id)
+    else:
+        # Load all memories for the user
+        memories_data = db_manager.get_user_memories(user_id, limit=10000) # Adjust limit as needed
+
+    # Determine embedding dimension
+    if not memories_data:
+        embedding_dim = DEFAULT_EMBEDDING_DIM
+        print(f"No memories found in DB for this scope. Using default embedding dim: {embedding_dim}")
+    else:
+        # Ensure embeddings are valid tensors before accessing shape
+        first_valid_embedding = next((m['embeddings'] for m in memories_data if isinstance(m.get('embeddings'), torch.Tensor)), None)
+        if first_valid_embedding is not None:
+             embedding_dim = first_valid_embedding.shape[0]
+             print(f"Determined embedding dimension from loaded memories: {embedding_dim}")
+        else:
+             embedding_dim = DEFAULT_EMBEDDING_DIM
+             print(f"[Warning] No valid tensor embeddings found in loaded data. Using default dim: {embedding_dim}")
+
+
+    # Create the appropriate network instance
+    network: Union[ModernHopfieldNetwork, KernelizedHopfieldNetwork]
+    if network_type == "khm":
+        cfg = khm_config or {}
+        feature_dim = cfg.get("feature_dim", embedding_dim) # Default feature dim to embedding dim
+        hidden_dim = cfg.get("hidden_dim", DEFAULT_KHM_HIDDEN_DIM)
+        num_heads = cfg.get("num_heads", DEFAULT_KHM_NUM_HEADS)
+        print(f"Instantiating KernelizedHopfieldNetwork (Embed: {embedding_dim}, Feature: {feature_dim}, Hidden: {hidden_dim}, Heads: {num_heads})")
+        network = KernelizedHopfieldNetwork(
+            embedding_dim=embedding_dim,
+            feature_dim=feature_dim,
+            hidden_dim=hidden_dim,
+            num_heads=num_heads
         )
-        network.store(memory)
-    
+        # --- TODO: Load KHM Kernel State ---
+        # This requires saving/loading the feature_map's state_dict,
+        # potentially as a separate file or blob linked to the user/network.
+        # kernel_state_path = f"user_{user_id}_khm_kernel.pth"
+        # if os.path.exists(kernel_state_path):
+        #     try:
+        #         network.feature_map.load_state_dict(torch.load(kernel_state_path))
+        #         network.feature_map.eval() # Set to evaluation mode
+        #         print(f"Loaded trained KHM kernel state from {kernel_state_path}")
+        #     except Exception as load_e:
+        #         print(f"[Warning] Failed to load KHM kernel state: {load_e}. Kernel will be untrained.")
+        # else:
+        #     print("No saved KHM kernel state found. Kernel is untrained.")
+
+    else: # Default to Modern
+        print(f"Instantiating ModernHopfieldNetwork (Embed: {embedding_dim})")
+        network = ModernHopfieldNetwork(
+            embedding_dim=embedding_dim,
+            beta=8.0 # Or load beta from config if needed
+        )
+
+    # Load document containers associated with the loaded memories or the user
+    print("Loading document containers...")
+    relevant_container_ids = set(m['parent_id'] for m in memories_data if m.get('parent_id'))
+    if document_id:
+         relevant_container_ids.add(document_id) # Ensure the specified one is included
+
+    # Fetch containers either specifically requested or belonging to the user
+    containers_to_load = {}
+    if document_id and document_id in relevant_container_ids:
+         container_data = db_manager.get_document_container(document_id)
+         if container_data:
+              containers_to_load[document_id] = container_data
+    else: # Load all user containers if no specific doc ID was the primary filter
+         user_containers = db_manager.get_user_document_containers(user_id)
+         for container_data in user_containers:
+              containers_to_load[container_data['document_id']] = container_data
+
+    for doc_id, container_data in containers_to_load.items():
+         # Filter for authorized containers again (belt-and-suspenders)
+         owner_id = container_data.get('user_id')
+         is_dev_null_access = user_id == "dev_user_123" and owner_id is None
+         if owner_id == user_id or is_dev_null_access:
+             container = DocumentContainer(
+                 title=container_data['title'], document_id=container_data['document_id'],
+                 timestamp=container_data['timestamp'], source_type=container_data['source_type'],
+                 metadata=container_data['metadata']
+             )
+             network.add_document_container(container)
+         else:
+              print(f"[Warning] Skipping unauthorized container {doc_id} during network load.")
+
+    print(f"Loaded {len(network.document_containers)} document containers into network object.")
+
+
+    # Load memories into the network object
+    loaded_memory_count = 0
+    for memory_data in memories_data:
+         # Ensure embedding is a tensor before creating Memory object
+         if not isinstance(memory_data.get('embeddings'), torch.Tensor):
+              print(f"[Warning] Skipping memory {memory_data.get('memory_id')} due to invalid embedding type: {type(memory_data.get('embeddings'))}")
+              continue
+
+         memory = Memory(
+             name=memory_data['name'], original_text=memory_data['original_text'],
+             embeddings=memory_data['embeddings'], memory_id=memory_data['memory_id'],
+             timestamp=memory_data['timestamp'], parent_id=memory_data['parent_id'],
+             section_title=memory_data['section_title'], metadata=memory_data['metadata']
+         )
+         # Add memory to network state and update container link
+         network.store(memory)
+         loaded_memory_count += 1
+
+    print(f"Loaded {loaded_memory_count} memories into network object.")
+
+    if not network.memories:
+        print(f"[Info] No memories loaded into network object for user {user_id} (Doc: {document_id}). Network is empty.")
+
+
     return network
 
-def save_network_to_db(network: Any, db_manager: SQLiteManager, user_id: Optional[str] = None):
+# --- MODIFIED: Function to save network to DB ---
+def save_network_to_db(
+    network: Union[ModernHopfieldNetwork, KernelizedHopfieldNetwork, Any],
+    db_manager: SQLiteManager,
+    user_id: Optional[str] = None
+) -> Dict[str, int]:
     """
-    Save a ModernHopfieldNetwork to the database
+    Save a Hopfield Network (memories and containers) to the database.
     Args:
-        network: ModernHopfieldNetwork instance
-        db_manager: SQLiteManager instance
-        user_id: Optional user ID to associate with memories
+        network: ModernHopfieldNetwork or KernelizedHopfieldNetwork instance.
+        db_manager: SQLiteManager instance.
+        user_id: Optional user ID to associate with memories/containers.
     Returns:
-        Dict with statistics about created and updated objects
+        Dict with statistics about created and updated objects.
     """
-    from temporal_hopfield_network import ModernHopfieldNetwork
-    network = cast(ModernHopfieldNetwork, network)
-    
+    if not user_id:
+        print("[Warning] Saving network without a user_id. Objects may not be linked to a user.")
+        # Potentially try to infer user_id if all objects belong to one user? Risky.
+
     stats = {
-        "documents_created": 0,
-        "documents_updated": 0,
-        "memories_created": 0,
-        "memories_updated": 0
+        "documents_created": 0, "documents_updated": 0, "documents_failed": 0,
+        "memories_created": 0, "memories_updated": 0, "memories_failed": 0
     }
-    
-    # Save document containers
+
+    # Save/Update document containers present in the network object
     for doc_id, container in network.document_containers.items():
         container_data = {
-            'document_id': container.document_id,
-            'title': container.title,
-            'timestamp': container.timestamp,
-            'source_type': container.source_type,
+            'document_id': container.document_id, 'title': container.title,
+            'timestamp': container.timestamp, 'source_type': container.source_type,
             'metadata': container.metadata
         }
         try:
-            # Check if document exists first
             existing_doc = db_manager.get_document_container(container.document_id)
             if existing_doc:
-                # Update logic would go here if needed
+                # Update existing document - ensure user_id matches if already set
+                if existing_doc.get('user_id') and existing_doc.get('user_id') != user_id:
+                     print(f"[Warning] Skipping update for document container {container.document_id} due to user_id mismatch.")
+                     stats["documents_failed"] += 1
+                     continue
+                db_manager.update_document_container(container.document_id, container_data)
                 stats["documents_updated"] += 1
             else:
+                # Create new document
                 db_manager.create_document_container(container_data, user_id)
                 stats["documents_created"] += 1
         except Exception as e:
-            print(f"Warning: Could not save document container {container.document_id}: {str(e)}")
-    
-    # Save memories
+            print(f"[Error] Failed to save/update document container {container.document_id}: {str(e)}")
+            stats["documents_failed"] += 1
+
+    # Save/Update memories present in the network object
     for memory in network.memories:
+        # Ensure embedding is a tensor
+        if not isinstance(memory.embeddings, torch.Tensor):
+             print(f"[Warning] Skipping memory {memory.memory_id} during save: Invalid embedding type {type(memory.embeddings)}")
+             stats["memories_failed"] += 1
+             continue
+
         memory_data = {
-            'memory_id': memory.memory_id,
-            'name': memory.name,
-            'original_text': memory.original_text,
-            'embeddings': memory.embeddings,
-            'timestamp': memory.timestamp,
-            'parent_id': memory.parent_id,
-            'section_title': memory.section_title,
-            'metadata': memory.metadata
+            'memory_id': memory.memory_id, 'name': memory.name,
+            'original_text': memory.original_text, 'embeddings': memory.embeddings,
+            'timestamp': memory.timestamp, 'parent_id': memory.parent_id,
+            'section_title': memory.section_title, 'metadata': memory.metadata
         }
         try:
-            # Check if memory exists before attempting to save
-            existing_memory = db_manager.get_memory(memory.memory_id)
-            if existing_memory:
-                # Update existing memory
-                db_manager.update_memory(memory.memory_id, memory_data)
-                stats["memories_updated"] += 1
-            else:
-                # Create new memory
-                db_manager.create_memory(memory_data, user_id)
+            # Use create_memory which handles INSERT OR UPDATE logic based on existence check
+            _, created = db_manager.create_memory(memory_data, user_id)
+            if created:
                 stats["memories_created"] += 1
-        except sqlite3.IntegrityError as e:
-            if "UNIQUE constraint failed" in str(e):
-                # Handle unique constraint failure by updating instead
-                db_manager.update_memory(memory.memory_id, memory_data)
-                stats["memories_updated"] += 1
             else:
-                raise
+                stats["memories_updated"] += 1
         except Exception as e:
-            print(f"Warning: Could not save memory {memory.memory_id}: {str(e)}")
-    
+            print(f"[Error] Failed to save/update memory {memory.memory_id}: {str(e)}")
+            stats["memories_failed"] += 1
+
+
+    # --- TODO: Save KHM Kernel State ---
+    # if isinstance(network, KernelizedHopfieldNetwork) and user_id:
+    #     kernel_state_path = f"user_{user_id}_khm_kernel.pth"
+    #     try:
+    #         torch.save(network.feature_map.state_dict(), kernel_state_path)
+    #         print(f"Saved KHM kernel state to {kernel_state_path}")
+    #     except Exception as save_e:
+    #         print(f"[Error] Failed to save KHM kernel state: {save_e}")
+
     return stats

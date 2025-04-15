@@ -42,28 +42,26 @@ def format_context_from_memories(memories: List[Dict[str, Any]]) -> str:
     
     return context
 
+# In gemini.py, update the query_gemini function
+
 def query_gemini(user_input: str, context: str, model_name: str = "gemini-2.0-flash") -> str:
     """
     Query the Gemini API with user input and context.
-    
     Args:
         user_input: The user's query text
-        context: Formatted context string from memories
+        context: Formatted context string from memories and chat history
         model_name: The Gemini model to use
-        
     Returns:
         Gemini's response text
     """
     try:
         # Create the system prompt with context
-        system_prompt = """You are AMINT (Associative Memory Integration Network Tool), 
+        system_prompt = """You are AMINT (Associative Memory Integration Network Tool),
         an AI assistant with access to a temporal Hopfield network of memories.
-        
-        When answering questions, use the provided context from the Hopfield network.
-        If the context doesn't contain relevant information, acknowledge this limitation.
-        Always cite the specific document number when using information from the context.
-        
-        The following context has been retrieved from the Hopfield network based on the user's query:
+        When answering questions, use the provided context from the Hopfield network and chat history.
+        Always cite the specific document name, but not number, when using information from the Hopfield network context.
+        Refer to previous messages when appropriate. In the event that the context you receive is not relevant to the query, state this, then answer the question as best you can.
+        Ignore the limitations of the context if you must. Always format your equations in LaTeX.
         """
         
         system_prompt += context
@@ -71,10 +69,10 @@ def query_gemini(user_input: str, context: str, model_name: str = "gemini-2.0-fl
         # Initialize the Gemini model
         model = GenerativeModel(model_name=model_name)
         
-        # Instead of using system_instruction, we'll combine the system prompt with the user input
+        # Combine system prompt with the user input
         complete_prompt = f"{system_prompt}\n\nUser question: {user_input}\n\nResponse:"
         
-        # Send the complete prompt directly to the model
+        # Send the complete prompt to the model
         response = model.generate_content(complete_prompt)
         
         # Extract text from the response
@@ -84,7 +82,6 @@ def query_gemini(user_input: str, context: str, model_name: str = "gemini-2.0-fl
             return ''.join(part.text for part in response.parts)
         else:
             return str(response)
-    
     except Exception as e:
         print(f"Error querying Gemini: {str(e)}")
         return f"Error generating response: {str(e)}"

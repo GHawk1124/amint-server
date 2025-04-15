@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from sentence_transformers import SentenceTransformer
 import nltk
 from nltk.tokenize import sent_tokenize
+import math
 
 class Memory:
     """Class to store memory entries with metadata and embeddings"""
@@ -82,6 +83,9 @@ class ModernHopfieldNetwork:
         self.beta = beta
         self.memories = []
         self.document_containers = {}  # Document ID -> DocumentContainer mapping
+
+        # Initialize multi-head retrieval mechanism
+        self.multi_head = MultiHeadRetrieval(embedding_dim)
         
     def store(self, memory: Memory) -> None:
         """
@@ -131,41 +135,102 @@ class ModernHopfieldNetwork:
         container = self.document_containers[document_id]
         return [memory for memory in self.memories if memory.memory_id in container.sections]
     
-    def retrieve(self, query_embedding: torch.Tensor, k: int = 1, document_id: Optional[str] = None) -> List[Memory]:
+    # Enhanced similarity computation with cosine similarity
+    def retrieve(self, query_embedding: torch.Tensor, similarity_threshold: float = 0.75, document_id: Optional[str] = None) -> List[Memory]:
         """
-        Retrieve the k most similar memories to the query embedding.
-        
+        Retrieve memories based on similarity threshold.
+
         Args:
-            query_embedding: Embedding of the query
-            k: Number of memories to retrieve
-            document_id: Optional document ID to restrict search to
-            
+            query_embedding: Embedding of the query text.
+            similarity_threshold: The minimum similarity score for a memory to be retrieved.
+            document_id: Optional ID to restrict search to a specific document.
+
         Returns:
-            List of the k most similar memories
+            List of Memory objects exceeding the similarity threshold, sorted by similarity score (desc).
         """
         if not self.memories:
             return []
-        
+
         # If document_id is provided, restrict search to memories from that document
         target_memories = self.get_document_memories(document_id) if document_id else self.memories
-        
         if not target_memories:
             return []
-        
+
         # Stack all memory embeddings
         memory_embeddings = torch.stack([memory.embeddings for memory in target_memories])
+
+        # Use the multi-head retrieval mechanism to get similarity scores
+        # We ignore the attention weights here, focusing on similarity
+        _, combined_similarity = self.multi_head.retrieve(query_embedding, memory_embeddings, self.beta)
+
+        # Find indices where similarity meets the threshold
+        indices = torch.where(combined_similarity >= similarity_threshold)[0]
+
+        # If no memories meet the threshold, return empty list
+        if indices.numel() == 0:
+            return []
+
+        # Get the memories and their scores
+        retrieved_memories = [target_memories[idx.item()] for idx in indices]
+        retrieved_scores = combined_similarity[indices]
+
+        # Sort the results by similarity score in descending order
+        sorted_indices = torch.argsort(retrieved_scores, descending=True)
+        sorted_memories = [retrieved_memories[i] for i in sorted_indices]
+
+        return sorted_memories
+
+    def semantic_chunk_text(self, text: str, max_chunk_length: int = 1000) -> List[str]:
+        """
+        Split text into semantically coherent chunks.
         
-        # Compute similarity between query and all memories
-        similarity = torch.matmul(query_embedding, memory_embeddings.T)
+        Args:
+        text: Text to split
+        max_chunk_length: Maximum length of a chunk in characters
         
-        # Apply softmax with temperature beta (core of modern Hopfield update rule)
-        attention = F.softmax(self.beta * similarity, dim=0)
+        Returns:
+            List of text chunks
+        """
+        sentences = sent_tokenize(text)
+        chunks = []
+        current_chunk = []
+        current_length = 0
         
-        # Get the indices of the k memories with highest attention
-        _, indices = torch.topk(attention, min(k, len(target_memories)))
+        # Get embeddings for all sentences
+        sentence_embeddings = [self.embed_text(sentence) for sentence in sentences]
         
-        # Return the corresponding memories
-        return [target_memories[idx.item()] for idx in indices]
+        for i, (sentence, embedding) in enumerate(zip(sentences, sentence_embeddings)):
+            # Start a new chunk if this would exceed max length
+            if current_length + len(sentence) > max_chunk_length and current_chunk:
+                chunks.append(' '.join(current_chunk))
+                current_chunk = []
+                current_length = 0
+            
+            # If we have a current chunk, check semantic similarity to decide
+            if current_chunk and i > 0:
+                # Calculate average embedding of current chunk
+                current_emb = torch.mean(torch.stack([
+                    sentence_embeddings[sentences.index(s)] 
+                    for s in current_chunk
+                ]), dim=0)
+                
+                # Check similarity with previous and next sentence
+                prev_sim = F.cosine_similarity(current_emb, embedding.unsqueeze(0), dim=1).item()
+                
+                # If similarity is below threshold and we have enough for a chunk, start new one
+                if prev_sim < 0.7 and len(current_chunk) >= 2:
+                    chunks.append(' '.join(current_chunk))
+                    current_chunk = []
+                    current_length = 0
+            
+            current_chunk.append(sentence)
+            current_length += len(sentence)
+        
+        # Add any remaining text as the final chunk
+        if current_chunk:
+            chunks.append(' '.join(current_chunk))
+        
+        return chunks
     
     def update(self, memory_id: str, new_embedding: torch.Tensor, new_text: Optional[str] = None) -> bool:
         """
@@ -506,6 +571,59 @@ class TextProcessor:
                 document.add_section(memory.memory_id)
                 
         return document, all_memories
+
+class MultiHeadRetrieval:
+    """Implementation of multi-headed retrieval mechanism"""
+    def __init__(self, embedding_dim: int, num_heads: int = 4):
+        self.num_heads = num_heads
+        self.embedding_dim = embedding_dim
+        
+        # Create projection matrices for each head
+        self.projection_matrices = nn.ModuleList([
+            nn.Linear(embedding_dim, embedding_dim) 
+            for _ in range(num_heads)
+        ])
+        
+    def retrieve(self, query_embedding: torch.Tensor, memory_embeddings: torch.Tensor, beta: float = 8.0) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Multi-headed retrieval mechanism.
+
+        Args:
+            query_embedding: The query embedding tensor.
+            memory_embeddings: The memory embeddings tensor (N x embedding_dim).
+            beta: Softmax temperature.
+
+        Returns:
+            Tuple of (combined_attention, combined_similarity):
+            - combined_attention: Softmax attention weights over memories (shape: N).
+            - combined_similarity: Averaged cosine similarity scores (shape: N).
+        """
+        head_attentions = []
+        head_similarities = [] # Store similarities from each head
+
+        for head in range(self.num_heads):
+            # Project query and memories
+            projected_query = self.projection_matrices[head](query_embedding)
+            projected_memories = self.projection_matrices[head](memory_embeddings)
+
+            # Normalize
+            projected_query = F.normalize(projected_query, p=2, dim=0)
+            projected_memories = F.normalize(projected_memories, p=2, dim=1)
+
+            # Calculate similarity (cosine similarity)
+            # Ensure query is broadcastable: (D) -> (1, D)
+            similarity = torch.matmul(projected_query.unsqueeze(0), projected_memories.T).squeeze(0) # Result shape (N)
+            head_similarities.append(similarity)
+
+            # Get attention weights (softmax)
+            attention = F.softmax(beta * similarity, dim=0)
+            head_attentions.append(attention)
+
+        # Combine attentions and similarities from all heads (average)
+        combined_attention = torch.mean(torch.stack(head_attentions), dim=0)
+        combined_similarity = torch.mean(torch.stack(head_similarities), dim=0)
+
+        return combined_attention, combined_similarity
 
 # Example usage
 def example_usage():

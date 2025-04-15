@@ -2,7 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Req
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Union
 import os
 import json
 import uuid
@@ -19,12 +19,41 @@ import google.generativeai as genai
 from gemini import format_context_from_memories, query_gemini
 # Import our modules
 from temporal_hopfield_network import ModernHopfieldNetwork, Memory, DocumentContainer, TextProcessor
+from khm_network import KernelizedHopfieldNetwork
 from sqlite import SQLiteManager, create_hopfield_network_from_db, save_network_to_db
 from mistral import get_ocr_result
 from dotenv import load_dotenv
 import jwt
 from fastapi.security import OAuth2PasswordBearer
 from starlette.middleware.sessions import SessionMiddleware
+import hashlib
+from fastapi import Path as FastApiPath
+
+# Function to calculate file hash
+def calculate_file_hash(file_path):
+    """Calculate SHA-256 hash of a file"""
+    hash_sha256 = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        # Read and update hash in chunks to handle large files efficiently
+        for chunk in iter(lambda: f.read(4096), b""):
+            hash_sha256.update(chunk)
+    return hash_sha256.hexdigest()
+
+# Function to check if a file hash already exists
+def file_hash_exists(db_manager, user_id, file_hash):
+    """Check if a file with this hash has already been uploaded by this user"""
+    try:
+        # Get all documents for this user
+        documents = db_manager.get_user_document_containers(user_id)
+        # Check if any document has this hash in its metadata
+        for doc in documents:
+            metadata = doc['metadata'] or {}
+            if metadata.get('file_hash') == file_hash:
+                return True, doc
+        return False, None
+    except Exception as e:
+        print(f"Error checking file hash: {str(e)}")
+        return False, None
 
 # Load environment variables
 load_dotenv()
@@ -44,6 +73,27 @@ GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/google/callback")
 if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
     raise ValueError("Google OAuth environment variables not set")
+
+NETWORK_TYPE = os.getenv("NETWORK_TYPE", "modern").lower() # Default to 'modern'
+# --- NEW: KHM Configuration (Optional - Read from env or use defaults) ---
+KHM_FEATURE_DIM = int(os.getenv("KHM_FEATURE_DIM", "384")) # Default to embedding_dim
+KHM_HIDDEN_DIM = int(os.getenv("KHM_HIDDEN_DIM", "512"))
+KHM_NUM_HEADS = int(os.getenv("KHM_NUM_HEADS", "4"))
+KHM_BETA = float(os.getenv("KHM_BETA", "8.0")) # Beta for KHM retrieval
+KHM_TRAIN_EPOCHS = int(os.getenv("KHM_TRAIN_EPOCHS", "300"))
+KHM_TRAIN_LR = float(os.getenv("KHM_TRAIN_LR", "0.001"))
+DEFAULT_EMBEDDING_DIM = 384 # Default for MiniLM-L6-v2 if no memories exist yet
+
+# Define context limits (e.g., in characters)
+# Example: Aim for ~16k char (~4k token) context window, use half for buffer
+DEFAULT_CONTEXT_CHAR_LIMIT = 16000
+MAX_CONTEXT_CHAR_TARGET = int(os.getenv("MAX_CONTEXT_CHAR_TARGET", DEFAULT_CONTEXT_CHAR_LIMIT))
+CONTEXT_BUDGET = MAX_CONTEXT_CHAR_TARGET // 2
+print(f"Using Context Budget (Chars): {CONTEXT_BUDGET} (Target Window: {MAX_CONTEXT_CHAR_TARGET})")
+
+print(f"Using Network Type: {NETWORK_TYPE.upper()}")
+if NETWORK_TYPE == "khm":
+    print(f"  KHM Config: feature_dim={KHM_FEATURE_DIM}, hidden_dim={KHM_HIDDEN_DIM}, heads={KHM_NUM_HEADS}, beta={KHM_BETA}")
 
 # Session secret key
 SECRET_KEY = os.getenv("SECRET_KEY", str(uuid.uuid4()))
@@ -118,12 +168,16 @@ class NetworkInfo(BaseModel):
 class MemoryQuery(BaseModel):
     query_text: str
     document_id: Optional[str] = None
-    k: int = 5
+    similarity_threshold: float = 0.75 # Use threshold instead of k, with a default
     use_gemini: bool = False
+    max_gemini_context: int = 5 # Max memories to feed to Gemini
 
 class FileQuery(BaseModel):
     query_text: str
-    file_types: Optional[List[str]] = None  # e.g., ["python", "javascript", "md"]
+    file_types: Optional[List[str]] = None
+    # k: int = 5 # Remove k
+    similarity_threshold: float = 0.7 # Add threshold for file search? Default lower?
+    # Or keep k for file search if thresholding doesn't make sense? Let's keep k for now unless specified otherwise.
     k: int = 5
 
 class DummyFileData(BaseModel):
@@ -134,6 +188,9 @@ class MemoryQueryResponse(BaseModel):
     results: List[Dict[str, Any]]
     gemini_response: Optional[str] = None
     use_gemini: bool = False
+    retrieved_count: int # Add count of retrieved items before Gemini limit
+    threshold_used: float # Add threshold used
+    similarity_scores: Optional[List[float]] = None
 
 # OAuth2 password bearer for token validation
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token", auto_error=False)
@@ -146,17 +203,41 @@ async def get_current_user(request: Request):
         return None
     return db_manager.get_user(user_id)
 
-# Helper function to get a network for a user
-def get_user_network(user_id: str, document_id: Optional[str] = None) -> ModernHopfieldNetwork:
-    """Get or create a Hopfield network for a user"""
+def get_user_network(user_id: str, document_id: Optional[str] = None) -> Union[ModernHopfieldNetwork, KernelizedHopfieldNetwork, Any]: # Use Union or Any
+    """Get or create a Hopfield network (Modern or KHM) for a user based on NETWORK_TYPE."""
+    global NETWORK_TYPE # Access the global config
     try:
-        # Try to load existing network from database
-        network = create_hopfield_network_from_db(db_manager, document_id, user_id)
+        # Try to load existing network from database, passing the type
+        network = create_hopfield_network_from_db(
+            db_manager,
+            network_type=NETWORK_TYPE,
+            document_id=document_id,
+            user_id=user_id,
+            # Pass KHM config in case loading needs it (though create_hopfield currently determines dim from data)
+            khm_config={
+                "feature_dim": KHM_FEATURE_DIM,
+                "hidden_dim": KHM_HIDDEN_DIM,
+                "num_heads": KHM_NUM_HEADS
+            }
+        )
+        # TODO: If KHM, potentially load kernel state here if sqlite.py is enhanced
         return network
     except Exception as e:
-        # If no network exists, create a new one
-        print(f"Creating new network for user {user_id}: {str(e)}")
-        network = ModernHopfieldNetwork(embedding_dim=384)  # Default embedding dim for MiniLM-L6-v2
+        # If no network exists or loading fails, create a new one
+        print(f"Creating new {NETWORK_TYPE.upper()} network for user {user_id}. Reason: {str(e)}")
+        if NETWORK_TYPE == "khm":
+            # Pass KHM specific config
+            network = KernelizedHopfieldNetwork(
+                embedding_dim=DEFAULT_EMBEDDING_DIM, # Default, might be overwritten if data exists later
+                feature_dim=KHM_FEATURE_DIM,
+                hidden_dim=KHM_HIDDEN_DIM,
+                num_heads=KHM_NUM_HEADS
+            )
+        else: # Default to Modern
+            network = ModernHopfieldNetwork(
+                embedding_dim=DEFAULT_EMBEDDING_DIM, # Default
+                beta=8.0 # Or read beta from env if needed for ModernHopfieldNetwork too
+            )
         return network
 
 # Routes
@@ -207,7 +288,31 @@ async def google_callback(request: Request, code: str):
         
         # Decode the id_token to get user info (without verification for simplicity)
         # In production, you should verify the token's signature
-        user_info = jwt.decode(id_token, options={"verify_signature": False})
+        # Different JWT libraries have different methods - this works with PyJWT
+        try:
+            # First, try the PyJWT style
+            user_info = jwt.decode(id_token, key=None, algorithms=["RS256"], options={"verify_signature": False})
+        except (AttributeError, TypeError):
+            # If that fails, try to parse it manually as a fallback
+            import base64
+            import json
+            
+            # Extract the payload part of the JWT (second part)
+            parts = id_token.split('.')
+            if len(parts) != 3:
+                raise ValueError("Invalid JWT format")
+                
+            # Get the middle part (payload)
+            payload = parts[1]
+            
+            # Add padding if needed
+            payload += '=' * (4 - len(payload) % 4)
+            
+            # Decode base64
+            decoded = base64.b64decode(payload.replace('-', '+').replace('_', '/'))
+            
+            # Parse JSON
+            user_info = json.loads(decoded)
         
         # Create a unique ID for this Google user
         google_user_id = f"google_{user_info.get('sub')}"
@@ -220,7 +325,7 @@ async def google_callback(request: Request, code: str):
             "picture": user_info.get("picture"),
             "access_token": access_token,
             "refresh_token": refresh_token,
-            "token_expiry": (datetime.now() + timedelta(seconds=token_info.get("expires_in", 3600))).isoformat()
+            "token_expiry": str(datetime.now() + timedelta(seconds=token_info.get("expires_in", 3600)))
         }
         
         user_id = db_manager.create_user(user_data)
@@ -232,14 +337,14 @@ async def google_callback(request: Request, code: str):
         network = get_user_network(user_id)
         
         # Redirect to the frontend with success
-        frontend_url = "http://localhost:1420" if not IS_PRODUCTION else "https://ghawk1124.github.io/amint"
+        frontend_url = "http://localhost:1420" if not IS_PRODUCTION else "https://ghawk1124.github.io/amint/dist"
         return RedirectResponse(f"{frontend_url}?auth=success")
     
     except Exception as e:
         print(f"Google OAuth error: {str(e)}")
         print(traceback.format_exc())
         # Redirect to the frontend with error
-        frontend_url = "http://localhost:1420" if not IS_PRODUCTION else "https://ghawk1124.github.io/amint"
+        frontend_url = "http://localhost:1420" if not IS_PRODUCTION else "https://ghawk1124.github.io/amint/dist"
         return RedirectResponse(f"{frontend_url}?auth=error&message={str(e)}")
 
 @app.get("/auth/session")
@@ -380,218 +485,349 @@ async def upload_document(
     title: str = Form(...),
     file: UploadFile = File(...)
 ):
-    """Upload a document file, process it with OCR if needed, and add to the Hopfield network"""
+    """Upload a document file, process it, add to the network, and potentially train KHM kernel."""
     user = await get_current_user(request)
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-        
+
+    network: Union[ModernHopfieldNetwork, KernelizedHopfieldNetwork, Any] = None # Initialize network variable
+    file_path_str = None # Initialize file_path_str
+
     try:
         user_id = user["id"]
-        
-        # Create a unique filename
-        file_extension = os.path.splitext(file.filename)[1] if file.filename else ""
+        # --- File Handling & Hashing (Keep as is) ---
+        file_extension = os.path.splitext(file.filename)[1].lower() if file.filename else ""
         unique_filename = f"{uuid.uuid4()}{file_extension}"
         file_path = UPLOAD_DIR / unique_filename
-        
-        # Save the uploaded file
+        file_path_str = str(file_path) # Store as string for finally block
+
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-        
-        # Process file based on type
-        if file_extension.lower() in ['.pdf', '.jpg', '.jpeg', '.png']:
-            # Use Mistral OCR
-            extracted_text = get_ocr_result(MISTRAL_API_KEY, str(file_path))
+
+        file_hash = calculate_file_hash(file_path_str)
+        hash_exists, existing_doc = file_hash_exists(db_manager, user_id, file_hash)
+        if hash_exists:
+            # Clean up the newly uploaded (duplicate) file before returning
+            os.remove(file_path_str)
+            return {
+                "status": "duplicate",
+                "message": "This file has already been uploaded",
+                "document_id": existing_doc['document_id'],
+                "title": existing_doc['title'],
+                "original_upload_date": existing_doc['timestamp']
+            }
+
+        # --- OCR / Text Extraction (Keep as is) ---
+        if file_extension in ['.pdf', '.jpg', '.jpeg', '.png']:
+            extracted_text = get_ocr_result(MISTRAL_API_KEY, file_path_str)
         else:
-            # Assume it's a text file
             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                 extracted_text = f.read()
-        
-        # Create document container if not provided
+
+        # --- Document Container Creation/Update (Keep as is, but ensure doc ID is captured) ---
+        container_metadata = {
+            "original_filename": file.filename,
+            "file_hash": file_hash,
+            "upload_date": str(datetime.now())
+        }
         if not document_id:
             container = DocumentContainer(
                 title=title,
-                source_type="uploaded_file",
-                metadata={"original_filename": file.filename}
+                source_type=f"{file_extension.lstrip('.')}_uploaded_file", # More specific source type
+                metadata=container_metadata
             )
-            # Create a properly structured dictionary
             container_data = {
-                'document_id': container.document_id,
-                'title': container.title,
-                'timestamp': container.timestamp,
-                'source_type': container.source_type,
+                'document_id': container.document_id, 'title': container.title,
+                'timestamp': container.timestamp, 'source_type': container.source_type,
                 'metadata': container.metadata
             }
-            # Explicitly create document container and get the ID
             document_id = db_manager.create_document_container(container_data, user_id)
             print(f"Created document container with ID: {document_id}")
         else:
-            # Verify document container exists if ID was provided
-            existing_container = db_manager.get_document_container(document_id)
-            if not existing_container:
-                raise HTTPException(status_code=404, detail="Document container not found")
-            container = DocumentContainer(
-                document_id=document_id,
-                title=title
-            )
-        
-        # Process the text and create memories
-        container, memories = text_processor.process_document(
+            # Verify existing container and update hash
+            existing_container_data = db_manager.get_document_container(document_id)
+            if not existing_container_data:
+                 raise HTTPException(status_code=404, detail="Document container not found")
+            # Important: Ensure user owns this container
+            if existing_container_data.get("user_id") != user_id:
+                raise HTTPException(status_code=403, detail="Not authorized to add to this document container")
+
+            existing_meta = existing_container_data.get('metadata', {})
+            existing_meta.update(container_metadata) # Merge new meta like hash
+            # Update the title and metadata in the DB if necessary
+            db_manager.update_document_container(document_id, {'title': title, 'metadata': existing_meta})
+            print(f"Using existing document container ID: {document_id}")
+
+
+        # --- Text Processing (Keep as is) ---
+        container_for_processing, memories = text_processor.process_document(
             title=title,
             text=extracted_text,
             chunk_size=3,
             max_chunk_length=1000,
             use_section_detection=True
         )
-        
-        # Make sure document_id is consistent
-        if container.document_id != document_id:
-            print(f"Warning: Document ID mismatch - updating from {container.document_id} to {document_id}")
-            container.document_id = document_id
-        
-        # Update parent_id for all memories
+
+        # --- IMPORTANT: Assign the correct document_id to memories ---
         for memory in memories:
-            memory.parent_id = document_id
-        
-        # Get user's network
-        network = get_user_network(user_id, document_id)
-        
+            memory.parent_id = document_id # Ensure memories link to the correct container
+
+        # --- Network Interaction ---
+        # Get the correct network type (Modern or KHM)
+        # Pass the specific document_id to load only relevant parts if applicable by implementation
+        network = get_user_network(user_id, document_id=None) # Load the user's general network first
+
+        # Ensure network's embedding dimension matches if it was newly created
+        if not network.memories and memories: # If network is new and we have memories
+            first_embedding_dim = memories[0].embeddings.shape[0]
+            if network.embedding_dim != first_embedding_dim:
+                print(f"Adjusting new network embedding dimension from {network.embedding_dim} to {first_embedding_dim}")
+                network.embedding_dim = first_embedding_dim
+                # If KHM, the feature map input dim might need adjustment IF it wasn't set correctly initially
+                if NETWORK_TYPE == 'khm' and isinstance(network, KernelizedHopfieldNetwork):
+                     # Re-initialize feature map if necessary (this loses untrained state)
+                     # A better approach would be to ensure correct initial dim
+                     if network.feature_map.layer1.in_features != first_embedding_dim:
+                          print(f"Re-initializing KHM feature map for input dim {first_embedding_dim}")
+                          network.feature_map = FeatureMap(first_embedding_dim, KHM_HIDDEN_DIM, KHM_FEATURE_DIM)
+
         # Add memories to network
         network.batch_store(memories)
-        
-        # Save network to database
+
+        # --- Save Network State ---
+        # TODO: Enhance save_network_to_db to handle KHM kernel state if needed
         save_stats = save_network_to_db(network, db_manager, user_id)
         print(f"Network save stats: {save_stats}")
-        
+
+        # --- KHM Specific: Train Kernel ---
+        if NETWORK_TYPE == "khm" and isinstance(network, KernelizedHopfieldNetwork):
+            print("Training KHM kernel after document upload...")
+            try:
+                network.train_kernel(epochs=KHM_TRAIN_EPOCHS, lr=KHM_TRAIN_LR)
+                # TODO: Save the trained kernel state if sqlite.py is enhanced
+                print("KHM Kernel training complete.")
+                # Re-save DB entries? Only if training modified embeddings/metadata (unlikely with current KHM setup)
+                # save_network_to_db(network, db_manager, user_id)
+            except Exception as train_e:
+                print(f"ERROR during KHM kernel training: {str(train_e)}")
+                # Decide if this should be a hard failure or just a warning
+                # raise HTTPException(status_code=500, detail=f"Failed to train KHM kernel: {str(train_e)}")
+
+
         return {
             "status": "success",
             "document_id": document_id,
             "title": title,
-            "memories_added": len(memories)
+            "memories_added": len(memories),
+            "network_type": NETWORK_TYPE # Optional: return type used
         }
+
     except Exception as e:
         print(f"Error processing document: {str(e)}")
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Failed to process document: {str(e)}")
+
     finally:
         # Clean up uploaded file
-        if 'file_path' in locals() and os.path.exists(file_path):
-            os.remove(file_path)
+        if file_path_str and os.path.exists(file_path_str):
+            try:
+                os.remove(file_path_str)
+            except OSError as remove_e:
+                print(f"Error removing uploaded file {file_path_str}: {remove_e}")
 
+# --- MODIFIED: Memory Query Endpoint ---
 @app.post("/memories/query")
 async def query_memories(query: MemoryQuery, request: Request):
-    """Query the Hopfield network for memories matching the input text"""
+    """Query the Hopfield network (Modern or KHM) for memories."""
     user = await get_current_user(request)
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-        
+
     try:
         user_id = user["id"]
-        # Get user's network
+        # Get user's network (appropriate type based on env var)
+        # Load specific doc network if ID provided, otherwise user's general network
         network = get_user_network(user_id, query.document_id)
-        
+
+        total_memory_count_in_scope = db_manager.count_user_memories(user_id, query.document_id)
+        if total_memory_count_in_scope == 0:
+            print(f"No memories found in DB for user {user_id} (Doc: {query.document_id}). Returning empty.")
+            return MemoryQueryResponse(results=[], gemini_response=None, use_gemini=query.use_gemini, retrieved_count=0, threshold_used=-2.0, similarity_scores=None) # Use -2 for context budget mode signal
+
+        # Extract query and context (Keep as is)
+        query_text = query.query_text
+        chat_context_history = ""
+        if "Previous messages:" in query_text and "New message:" in query_text:
+             parts = query_text.split("New message:", 1)
+             chat_context_history = parts[0].replace("Previous messages:", "").strip()
+             query_text = parts[1].strip()
+
         # Embed query text
-        query_embedding = text_processor.embed_text(query.query_text)
+        query_embedding = text_processor.embed_text(query_text)
+
+        candidate_memories: List[Memory] = [] # Memories to consider for context budget
+        retrieval_mode_info = "" # For logging
+
+        if isinstance(network, KernelizedHopfieldNetwork):
+            print(f"Querying KHM network with beta={KHM_BETA}, threshold={query.similarity_threshold}")
+            print(f"Querying KHM network (retrieving all ranked for context budget)")
+            # KHM uses retrieve_with_kernel
+            # Note: retrieve_with_kernel currently returns sorted memories, not scores directly.
+            # We'd need to modify it or recalculate scores if needed for the response.
+            ALL_THRESHOLD = -1.0
+            candidate_memories = network.retrieve_with_kernel(
+                query_embedding,
+                beta=KHM_BETA,
+                similarity_threshold=ALL_THRESHOLD, # Get all results sorted by score
+                document_id=query.document_id
+            )
+            # TODO: Calculate/retrieve similarity scores if needed for KHM response
+            # Example recalculation (potentially slow):
+            # if retrieved_memories:
+            #    mapped_query = network.feature_map(query_embedding.to(next(network.feature_map.parameters()).device))
+            #    mapped_retrieved = network.feature_map(torch.stack([m.embeddings for m in retrieved_memories]).to(mapped_query.device))
+            #    scores_tensor = F.cosine_similarity(mapped_query.unsqueeze(0), mapped_retrieved, dim=1)
+            #    similarity_scores = scores_tensor.cpu().tolist()
+
+        elif isinstance(network, ModernHopfieldNetwork):
+            # For Modern, use the threshold first, then apply budget to those results
+            print(f"Querying Modern Hopfield network with threshold={query.similarity_threshold}")
+            retrieval_mode_info = f"Modern (Thresh: {query.similarity_threshold})"
+            candidate_memories = network.retrieve(
+                query_embedding,
+                similarity_threshold=query.similarity_threshold,
+                document_id=query.document_id
+            )
+
+        else:
+            # raise HTTPException(status_code=500, detail="Internal server error: Unknown network type")
+            print(f"[Warning] Unknown network type encountered: {type(network)}. Cannot perform retrieval.")
+            candidate_memories = []
+
+        print(f"{retrieval_mode_info} returned {len(candidate_memories)} candidate memories.")
         
-        # Retrieve memories
-        memories = network.retrieve(query_embedding, k=query.k, document_id=query.document_id)
+        # --- Apply Context Budget ---
+        context_limited_memories: List[Memory] = []
+        current_context_length = 0
+        if not candidate_memories:
+            print("No candidate memories to process for context budget.")
+        else:
+            for memory in candidate_memories:
+                mem_len = len(memory.original_text) # Use character length
+                if (current_context_length + mem_len) <= CONTEXT_BUDGET:
+                    context_limited_memories.append(memory)
+                    current_context_length += mem_len
+                else:
+                    # Stop adding once budget is exceeded
+                    print(f"Context budget ({CONTEXT_BUDGET} chars) reached after adding {len(context_limited_memories)} memories. Stopping.")
+                    break # Stop iterating through candidates
+            # Handle case where even the first memory exceeds the budget
+            if not context_limited_memories and candidate_memories:
+                 first_mem = candidate_memories[0]
+                 print(f"First memory ({len(first_mem.original_text)} chars) already exceeds budget ({CONTEXT_BUDGET}). Including just the first one.")
+                 context_limited_memories.append(first_mem)
+                 current_context_length = len(first_mem.original_text)
+
+
+        retrieved_memories = context_limited_memories # Final list after budgeting
+        retrieved_count = len(retrieved_memories)
         
-        # Format response
+        # Format results (Keep as is, maybe add similarity score if available)
         results = []
-        for memory in memories:
-            results.append({
+        for i, memory in enumerate(retrieved_memories):
+            result_item = {
                 "memory_id": memory.memory_id,
                 "text": memory.original_text,
                 "name": memory.name,
                 "section_title": memory.section_title,
-                "timestamp": memory.timestamp.isoformat() if memory.timestamp else None,
-                "metadata": memory.metadata
-            })
-        
-        # Get Gemini response if use_gemini flag is set
-        gemini_response = None
-        if getattr(query, 'use_gemini', False) and results:
-            # Format context from top memories
-            context = format_context_from_memories(results[:5])  # Use top 5 memories
-            # Query Gemini with user input and context
-            gemini_response = query_gemini(query.query_text, context)
-        
+                "timestamp": str(memory.timestamp) if memory.timestamp else None,
+                "metadata": memory.metadata,
+            }
+            # Add score if calculated/available
+            results.append(result_item)
+
+
+        gemini_response_text = None
+        if query.use_gemini:
+            hopfield_context = ""
+            # Apply max_gemini_context limit *on top of* the budgeted results
+            memories_for_gemini = results[:query.max_gemini_context]
+
+            if memories_for_gemini:
+                print(f"Generating context for Gemini from {len(memories_for_gemini)} memories (budgeted & limited).")
+                hopfield_context = format_context_from_memories(memories_for_gemini)
+            else:
+                print("No memories selected by context budget to send to Gemini.")
+                hopfield_context = "No relevant context found in documents based on the query."
+
+            full_context_for_gemini = ""
+            if chat_context_history:
+                full_context_for_gemini += f"CHAT HISTORY:\n{chat_context_history}\n\n"
+            full_context_for_gemini += hopfield_context
+
+            print("Querying Gemini...")
+            gemini_response_text = query_gemini(query_text, full_context_for_gemini)
+            print("Gemini response received.")
+
+        # --- Return Response ---
         return MemoryQueryResponse(
             results=results,
-            gemini_response=gemini_response,
-            use_gemini=getattr(query, 'use_gemini', False)
+            gemini_response=gemini_response_text,
+            use_gemini=query.use_gemini,
+            retrieved_count=retrieved_count, # Count after budgeting
+            threshold_used=-2.0, # Use -2.0 (or similar) to indicate context budget mode
+            similarity_scores=None # Scores are not directly used for filtering here
         )
+
     except Exception as e:
+        print(f"Error processing memory query: {str(e)}")
+        print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
 
+# --- MODIFIED: GET Memory Query Endpoint ---
 @app.get("/memories/query")
 async def query_memories_get(
     request: Request,
     query_text: str,
     document_id: Optional[str] = None,
-    k: int = 5,
-    use_gemini: bool = False
+    similarity_threshold: float = 0.75,
+    use_gemini: bool = False,
+    max_gemini_context: int = 5
 ):
-    """GET endpoint to query the Hopfield network for memories matching the input text"""
-    user = await get_current_user(request)
-    if not user:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-        
+    """GET endpoint to query the Hopfield network (Modern or KHM)."""
+    # Create the Pydantic model from GET parameters
+    query = MemoryQuery(
+        query_text=query_text,
+        document_id=document_id,
+        similarity_threshold=similarity_threshold,
+        use_gemini=use_gemini,
+        max_gemini_context=max_gemini_context
+    )
+    # Call the POST endpoint's logic
     try:
-        user_id = user["id"]
-        # Get user's network
-        network = get_user_network(user_id, document_id)
-        
-        # Embed query text
-        query_embedding = text_processor.embed_text(query_text)
-        
-        # Retrieve memories
-        memories = network.retrieve(query_embedding, k=k, document_id=document_id)
-        
-        # Format response
-        results = []
-        for memory in memories:
-            results.append({
-                "memory_id": memory.memory_id,
-                "text": memory.original_text,
-                "name": memory.name,
-                "section_title": memory.section_title,
-                "timestamp": memory.timestamp.isoformat() if memory.timestamp else None,
-                "metadata": memory.metadata
-            })
-        
-        # Get Gemini response if use_gemini flag is set
-        gemini_response = None
-        if use_gemini and results:
-            # Format context from top memories (limited to top 5)
-            top_memories = results[:5]
-            context = format_context_from_memories(top_memories)
-            # Query Gemini with user input and context
-            gemini_response = query_gemini(query_text, context)
-        
-        return {
-            "results": results,
-            "gemini_response": gemini_response,
-            "use_gemini": use_gemini
-        }
+        response_model = await query_memories(query=query, request=request)
+        # Convert Pydantic model back to dict for JSON response
+        return response_model.dict()
+    except HTTPException as http_exc:
+        raise http_exc # Re-raise HTTP exceptions
     except Exception as e:
-        import traceback
-        print(f"Query failed with error: {str(e)}")
+        # Handle other potential errors from the forwarded call
+        print(f"GET Query failed with error: {str(e)}")
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
 
 @app.get("/network/stats")
 async def get_network_stats(request: Request, document_id: Optional[str] = None):
-    """Get statistics about a user's network"""
+    """Get statistics about a user's network (works for both types)."""
     user = await get_current_user(request)
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-        
     try:
         user_id = user["id"]
-        # Get user's network
+        # Get network (type doesn't strictly matter for counts from DB)
         network = get_user_network(user_id, document_id)
-        
-        # Get document info if document_id is specified
+
+        # Get document info from the network object's state (if loaded/present)
         document_info = None
         if document_id and document_id in network.document_containers:
             container = network.document_containers[document_id]
@@ -599,189 +835,208 @@ async def get_network_stats(request: Request, document_id: Optional[str] = None)
                 "document_id": container.document_id,
                 "title": container.title,
                 "source_type": container.source_type,
-                "timestamp": container.timestamp.isoformat() if container.timestamp else None,
-                "section_count": len(container.sections)
+                "timestamp": str(container.timestamp) if container.timestamp else None,
+                # 'section_count': len(container.sections) # section count might be misleading if not fully loaded
             }
-        
-        # Count memories
-        memory_count = len(network.memories)
-        document_count = len(network.document_containers)
-        
+        # Get counts directly from the database for accuracy
+        memory_count = db_manager.count_user_memories(user_id)
+        document_count = db_manager.count_user_document_containers(user_id)
+
         return {
             "memory_count": memory_count,
             "document_count": document_count,
-            "document_info": document_info
+            "network_type": NETWORK_TYPE, # Include network type being used
+            "document_info": document_info, # Info about a specific doc if requested and found
         }
     except Exception as e:
+        print(f"Error getting network stats: {str(e)}")
+        print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Failed to get network stats: {str(e)}")
 
-if not IS_PRODUCTION:
-    @app.post("/dev/add-dummy-files")
-    async def add_dummy_files(data: DummyFileData, request: Request):
-        """Development endpoint to add dummy file data to a user's network for testing"""
-        user = await get_current_user(request)
-        if not user and data.user_id != "dev_user_123":  # Special case for dev user
-            raise HTTPException(status_code=401, detail="Not authenticated")
-            
-        user_id = user["id"] if user else data.user_id
-        print(f"[DEBUG] add_dummy_files called with user_id: {user_id}, file_count: {data.file_count}")
-        
-        try:
-            # Get the user's network
-            network = get_user_network(user_id)
-            print(f"[DEBUG] User network retrieved successfully: {len(network.memories)} existing memories")
-            
-            # Create a document container
-            document_container = DocumentContainer(
-                title="Dummy Files Collection",
-                source_type="code",
-                metadata={"type": "test_data", "generated_at": datetime.now().isoformat()}
-            )
-            
-            # Add the document container to the network
-            print("[DEBUG] Adding document container to network...")
-            network.add_document_container(document_container)
-            
-            # Sample code snippets with different file types
-            file_samples = [
-                {
-                    "name": "app.py",
-                    "content": """
-    def main():
-        print("Hello, world!")
-        # Process items in a loop
-        for i in range(10):
-            print(f"Processing item {i}")
-        return 0
-    if __name__ == "__main__":
-        main()
-                    """,
-                    "type": "python"
-                },
-                # ... [rest of the file samples remain the same]
-            ]
-            
-            print(f"[DEBUG] Loaded {len(file_samples)} file samples")
-            
-            # Generate memories for each file
-            memories = []
-            print(f"[DEBUG] Starting to process {data.file_count} files...")
-            
-            # Use only the number of files requested (with cycling if necessary)
-            for i in range(data.file_count):
-                file_sample = file_samples[i % len(file_samples)]
-                print(f"[DEBUG] Processing file {i+1}/{data.file_count}: {file_sample['name']}")
-                
-                try:
-                    # Create memory for the file
-                    # Embed the content using the text processor
-                    print(f"[DEBUG] Embedding content for {file_sample['name']}...")
-                    embedding = text_processor.embed_text(file_sample["content"])
-                    print(f"[DEBUG] Embedding created successfully, shape: {embedding.shape}")
-                    
-                    memory = Memory(
-                        name=file_sample["name"],
-                        original_text=file_sample["content"],
-                        embeddings=embedding,
-                        parent_id=document_container.document_id,
-                        metadata={
-                            "file_type": file_sample["type"],
-                            "line_count": len(file_sample["content"].split("\n")),
-                            "size_bytes": len(file_sample["content"]),
-                            "is_dummy": True
-                        }
-                    )
-                    memories.append(memory)
-                    print(f"[DEBUG] Memory object created for {file_sample['name']}")
-                except Exception as file_error:
-                    print(f"[DEBUG] Error processing file {file_sample['name']}: {str(file_error)}")
-                    print(f"[DEBUG] Error traceback: {traceback.format_exc()}")
-                    raise  # Re-raise to be caught by the outer try-except
-            
-            # Add memories to the network
-            print(f"[DEBUG] Adding {len(memories)} memories to network...")
-            network.batch_store(memories)
-            
-            # Save to database with statistics
-            print("[DEBUG] Saving network to database...")
-            try:
-                stats = save_network_to_db(network, db_manager, user_id)
-                print(f"[DEBUG] Network saved successfully. Stats: {stats}")
-            except Exception as db_error:
-                print(f"[DEBUG] Database error: {str(db_error)}")
-                print(f"[DEBUG] Database error traceback: {traceback.format_exc()}")
-                stats = {"error": str(db_error)}
-            
-            return {
-                "status": "success",
-                "message": f"Processed {len(memories)} files",
-                "document_id": document_container.document_id,
-                "file_names": [m.name for m in memories],
-                "stats": stats
-            }
-        except Exception as e:
-            print(f"[DEBUG] Error in add_dummy_files: {str(e)}")
-            print(f"[DEBUG] Error traceback: {traceback.format_exc()}")
-            raise HTTPException(status_code=500, detail=f"Adding dummy files failed: {str(e)}")
-
+# --- MODIFIED: File Query Endpoint ---
 @app.post("/files/query")
 async def query_files(query: FileQuery, request: Request):
-    """Query the Hopfield network for file content matching the input text"""
+    """Query the network for file content (works for both types, uses appropriate retrieve)."""
     user = await get_current_user(request)
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-        
+
     try:
         user_id = user["id"]
-        # Get user's network
-        network = get_user_network(user_id)
-        
-        # Embed query text
+        network = get_user_network(user_id) # Get the correct network type
         query_embedding = text_processor.embed_text(query.query_text)
-        
-        # Retrieve memories
-        memories = network.retrieve(query_embedding, k=query.k)
-        
-        # Filter by file types if specified
+
+        retrieved_memories: List[Memory] = []
+        similarity_scores: Optional[List[float]] = None
+
+        # --- Conditional Retrieval ---
+        if isinstance(network, KernelizedHopfieldNetwork):
+            print(f"Querying KHM network for files with beta={KHM_BETA}, threshold={query.similarity_threshold}")
+            # Use a low threshold for KHM file search initially? Or rely on its inherent separation?
+            # Let's use the query's threshold, assuming kernel helps separate file content.
+            retrieved_memories = network.retrieve_with_kernel(
+                query_embedding,
+                beta=KHM_BETA,
+                similarity_threshold=query.similarity_threshold, # Use specified threshold
+                document_id=None # Search all documents
+            )
+            # TODO: Calculate/retrieve scores if needed
+
+        elif isinstance(network, ModernHopfieldNetwork):
+            print(f"Querying Modern Hopfield network for files with threshold={query.similarity_threshold}")
+            retrieved_memories = network.retrieve(
+                query_embedding,
+                similarity_threshold=query.similarity_threshold, # Use specified threshold
+                document_id=None # Search all documents
+            )
+            # TODO: Get scores if ModernHopfieldNetwork returns them
+
+        else:
+            print(f"[Warning] Unknown network type encountered: {type(network)}. Cannot perform file query.")
+            return {"results": []}
+
+
+        # Filter and format results (Keep existing logic, maybe add score)
         file_results = []
-        for memory in memories:
-            # Check if this memory represents a file (has 'file_type' in metadata)
-            if memory.metadata and 'file_type' in memory.metadata:
-                # If file_types filter is applied and this file type is not in the list, skip it
+        count = 0
+        # We need to sort memories by score *after* retrieval if the retrieve method doesn't guarantee it,
+        # especially if scores are recalculated or not part of the primary return.
+        # For now, assume retrieve methods return reasonably sorted memories.
+        # If scores were available:
+        # memory_score_pairs = sorted(zip(retrieved_memories, similarity_scores), key=lambda x: x[1], reverse=True)
+        # for memory, score in memory_score_pairs: ...
+
+        for memory in retrieved_memories: # Iterate through potentially sorted memories
+            if memory.metadata and 'file_type' in memory.metadata: # Check if it looks like a file memory
                 if query.file_types and memory.metadata['file_type'] not in query.file_types:
                     continue
-                
-                file_results.append({
+
+                result_item = {
                     "memory_id": memory.memory_id,
                     "file_name": memory.name,
-                    "content": memory.original_text,
+                    "content": memory.original_text[:200] + ('...' if len(memory.original_text) > 200 else ''), # Truncate preview
                     "file_type": memory.metadata.get('file_type', 'unknown'),
                     "line_count": memory.metadata.get('line_count', 0),
                     "size_bytes": memory.metadata.get('size_bytes', 0),
-                    "timestamp": memory.timestamp.isoformat() if memory.timestamp else None,
-                    "relevance_score": round(float(torch.sigmoid(query_embedding @ memory.embeddings).item()), 4)
-                })
-        
+                    "timestamp": str(memory.timestamp) if memory.timestamp else None,
+                     # "relevance_score": round(score, 4) # If score was available
+                }
+                file_results.append(result_item)
+                count += 1
+                if count >= query.k: # Apply K limit *after* filtering and potentially sorting
+                    break
+
         return {"results": file_results}
+
     except Exception as e:
+        print(f"File query failed: {str(e)}")
+        print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"File query failed: {str(e)}")
 
+
+# --- MODIFIED: GET File Query Endpoint ---
 @app.get("/files/query")
 async def query_files_get(
     request: Request,
     query_text: str,
-    file_types: Optional[str] = None,  # Comma-separated file types
-    k: int = 5
+    file_types: Optional[str] = None, # Comma-separated file types
+    k: int = 5,
+    similarity_threshold: float = 0.7 # Add threshold parameter
 ):
-    """GET endpoint to query the Hopfield network for file content matching the input text"""
-    # Parse file_types from comma-separated string if provided
+    """GET endpoint to query the network for file content."""
     file_types_list = file_types.split(',') if file_types else None
-    
-    # Create a FileQuery object from GET parameters
-    query = FileQuery(query_text=query_text, file_types=file_types_list, k=k)
-    
-    # Reuse the POST endpoint logic
-    return await query_files(query, request)
+    # Create FileQuery model instance
+    query = FileQuery(
+        query_text=query_text,
+        file_types=file_types_list,
+        k=k,
+        similarity_threshold=similarity_threshold # Pass threshold
+    )
+    # Call the POST endpoint's logic
+    try:
+        return await query_files(query=query, request=request)
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        print(f"GET File Query failed: {str(e)}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"File query failed: {str(e)}")
+
+@app.get("/documents/{document_id}/content")
+async def get_document_content(
+    request: Request,
+    document_id: str = FastApiPath(..., description="The ID of the document to retrieve content for")
+):
+    """Retrieve the reconstructed content of a specific document."""
+    user = await get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    user_id = user["id"]
+
+    try:
+        # 1. Get the document container metadata
+        container_data = db_manager.get_document_container(document_id)
+        if not container_data:
+            raise HTTPException(status_code=404, detail="Document container not found")
+
+        # 2. Verify user owns this document
+        if container_data.get("user_id") != user_id:
+             # Check if user_id is null or doesn't match
+            is_dev_user_accessing_null = user_id == "dev_user_123" and container_data.get("user_id") is None
+            if not is_dev_user_accessing_null:
+                 raise HTTPException(status_code=403, detail="Not authorized to access this document")
+
+
+        # 3. Get all memories for this document
+        memories_data = db_manager.get_document_memories(document_id)
+
+        if not memories_data:
+            return {
+                "document_id": document_id,
+                "title": container_data.get("title", "Untitled"),
+                "content": "", # Return empty content if no memories
+                "source_type": container_data.get("source_type"),
+                "metadata": container_data.get("metadata", {})
+            }
+
+        # 4. Sort memories based on section and chunk index from metadata
+        def sort_key(memory):
+            meta = memory.get("metadata", {})
+            # Handle cases where indices might be missing, treat them as 0
+            section_index = meta.get("section_index", 0)
+            chunk_index = meta.get("chunk_index", 0)
+             # Ensure consistent types for comparison if needed (e.g., convert to int if they might be strings)
+            try:
+                section_index = int(section_index)
+            except (ValueError, TypeError):
+                section_index = 0 # Fallback
+            try:
+                chunk_index = int(chunk_index)
+            except (ValueError, TypeError):
+                chunk_index = 0 # Fallback
+
+            return (section_index, chunk_index)
+
+
+        sorted_memories = sorted(memories_data, key=sort_key)
+
+        # 5. Reconstruct the content by joining original_text
+        # Add double newline between sections/chunks for better readability
+        reconstructed_content = "\n\n".join([mem.get("original_text", "") for mem in sorted_memories])
+
+        return {
+            "document_id": document_id,
+            "title": container_data.get("title", "Untitled"),
+            "content": reconstructed_content,
+            "source_type": container_data.get("source_type"),
+             "metadata": container_data.get("metadata", {}) # Pass metadata too
+        }
+
+    except Exception as e:
+        print(f"Error retrieving document content for {document_id}: {str(e)}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve document content: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
